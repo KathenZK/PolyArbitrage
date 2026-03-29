@@ -152,8 +152,43 @@ class Orchestrator:
                 )
                 await asyncio.sleep(interval)
 
+    async def run_once(self):
+        """Single scan cycle — prints results as tables and exits."""
+        self._init_strategies()
+
+        conn = get_connection()
+        init_db(conn)
+        conn.close()
+
+        console.print("[bold blue]PolyArbitrage — Single Scan[/bold blue]")
+        console.print(f"  Strategies: {[s.name for s in self._strategies]}")
+        console.print()
+
+        for strategy in self._strategies:
+            console.print(f"[cyan]Scanning: {strategy.name}...[/cyan]")
+            try:
+                opps = await strategy.scan()
+                self.opportunities.extend(opps)
+                console.print(f"  Found [bold]{len(opps)}[/bold] opportunities\n")
+            except Exception as e:
+                console.print(f"  [red]Error: {e}[/red]\n")
+
+        self.opportunities.sort(key=lambda o: o.edge_pct, reverse=True)
+        self.scan_count = 1
+        self.last_scan = time.time()
+
+        from src.output.dashboard import build_opportunities_table, build_negrisk_detail_table
+        console.print(build_opportunities_table(self.opportunities))
+        console.print()
+        console.print(build_negrisk_detail_table(self.store))
+
     async def shutdown(self):
         await self.gamma.close()
+        for strategy in self._strategies:
+            for attr in ("_kalshi", "_espn"):
+                client = getattr(strategy, attr, None)
+                if client and hasattr(client, "close"):
+                    await client.close()
 
 
 def main():
@@ -166,8 +201,16 @@ def main():
     config = load_config()
     orchestrator = Orchestrator(config)
 
+    mode = sys.argv[1] if len(sys.argv) > 1 else "scan"
+
     try:
-        asyncio.run(orchestrator.run_dashboard())
+        if mode == "live":
+            asyncio.run(orchestrator.run_dashboard())
+        else:
+            async def _scan_and_close():
+                await orchestrator.run_once()
+                await orchestrator.shutdown()
+            asyncio.run(_scan_and_close())
     except KeyboardInterrupt:
         console.print("\n[yellow]Shutting down...[/yellow]")
         asyncio.run(orchestrator.shutdown())
