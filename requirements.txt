@@ -1,0 +1,12 @@
+aiohttp>=3.9
+websockets>=12.0
+rich>=13.7
+pyyaml>=6.0
+python-dotenv>=1.0
+py-clob-client>=0.34
+nba_api>=1.4
+espn-sports-api>=0.4
+sentence-transformers>=2.2
+scikit-learn>=1.4
+numpy>=1.26
+httpx>=0.27

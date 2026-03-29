@@ -1,0 +1,37 @@
+strategies:
+  cross_platform:
+    enabled: true
+    min_gross_edge: 0.0275
+    kalshi_fee: 0.0175
+    polymarket_fee: 0.0
+    bridge_cost: 0.005
+    poll_interval_sec: 10
+
+  negrisk:
+    enabled: true
+    min_deviation: 0.03
+    min_daily_volume: 50000
+    max_settlement_days: 30
+    scan_interval_sec: 30
+
+  sports_ev:
+    enabled: true
+    min_edge: 0.04
+    sports: ["nba", "ncaa"]
+    scan_interval_sec: 30
+
+risk:
+  daily_loss_limit_pct: 0.10
+  max_position_pct: 0.02
+  cooldown_sec: 60
+  dry_run: true
+
+alerts:
+  telegram_enabled: false
+  telegram_bot_token: ""
+  telegram_chat_id: ""
+
+capital:
+  total_usd: 10000
+  polymarket_allocation: 0.6
+  kalshi_allocation: 0.4
