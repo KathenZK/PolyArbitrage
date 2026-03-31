@@ -6,6 +6,7 @@ strategies:
     polymarket_fee: 0.0
     bridge_cost: 0.005
     poll_interval_sec: 10
+    kalshi_demo: true  # true = use demo API (no real money), false = production
 
   negrisk:
     enabled: true

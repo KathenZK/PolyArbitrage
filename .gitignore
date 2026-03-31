@@ -9,3 +9,5 @@ data/*.db
 data/*.json
 *.log
 .DS_Store
+*.pem
+*.key

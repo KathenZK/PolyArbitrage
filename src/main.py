@@ -82,6 +82,7 @@ class Orchestrator:
                     kalshi_fee=cp_cfg.get("kalshi_fee", 0.0175),
                     poly_fee=cp_cfg.get("polymarket_fee", 0.0),
                     bridge_cost=cp_cfg.get("bridge_cost", 0.005),
+                    kalshi_demo=cp_cfg.get("kalshi_demo", True),
                 ))
             except Exception as e:
                 logger.warning(f"Cross-platform strategy disabled: {e}")

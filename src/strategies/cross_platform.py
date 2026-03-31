@@ -30,10 +30,15 @@ class CrossPlatformStrategy(BaseStrategy):
         kalshi_fee: float = 0.0175,
         poly_fee: float = 0.0,
         bridge_cost: float = 0.005,
+        kalshi_demo: bool = True,
     ):
         self._gamma = gamma_client
         self._store = store
-        self._kalshi = KalshiClient(api_key_id=kalshi_key_id, private_key_path=kalshi_pk_path)
+        self._kalshi = KalshiClient(
+            api_key_id=kalshi_key_id,
+            private_key_path=kalshi_pk_path,
+            use_demo=kalshi_demo,
+        )
         self._matcher = EventMatcher(min_confidence=0.65)
         self._resolution_checker = ResolutionChecker()
         self._min_gross_edge = min_gross_edge
