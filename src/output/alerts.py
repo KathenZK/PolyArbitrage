@@ -1,8 +1,4 @@
-"""Alert system: DingTalk (钉钉) webhook notifications.
-
-Security: DingTalk custom robot requires every message to contain the
-configured keyword. We prepend "PolyGod" to all messages automatically.
-"""
+"""钉钉 Webhook 通知"""
 
 from __future__ import annotations
 
@@ -56,37 +52,44 @@ class DingTalkAlert:
         is_paper: bool,
         order_id: str,
     ):
-        mode = "PAPER" if is_paper else "LIVE"
+        mode = "模拟" if is_paper else "实盘"
         ts = datetime.now().strftime("%H:%M:%S")
+        arrow = "📈" if direction == "UP" else "📉"
+        side = "看涨" if direction == "UP" else "看跌"
         text = (
-            f"**{self._keyword} Trade #{order_id}**\n\n"
-            f"> **{direction}** {symbol} @ ${price:.3f}\n\n"
-            f"- Shares: {shares:.1f}\n"
-            f"- Cost: ${cost:.2f}\n"
-            f"- Momentum: {momentum:+.2%}\n"
-            f"- Mode: **{mode}**\n"
-            f"- Time: {ts}\n"
-            f"- Market: {market_question[:80]}\n"
+            f"**{self._keyword}** {arrow} **下单通知**\n\n"
+            f"> **{side} {symbol}** @ ${price:.3f}\n\n"
+            f"- 方向：{side}（买入 {'Up' if direction == 'UP' else 'Down'} token）\n"
+            f"- 价格：${price:.3f}\n"
+            f"- 数量：{shares:.1f} 股\n"
+            f"- 金额：${cost:.2f}\n"
+            f"- 偏离开盘价：{momentum:+.2%}\n"
+            f"- 模式：**{mode}**\n"
+            f"- 时间：{ts}\n"
+            f"- 订单号：{order_id}\n"
         )
-        await self.send_markdown(f"{mode} {direction} {symbol}", text)
+        await self.send_markdown(f"{mode} {side} {symbol}", text)
 
     async def send_signal(self, symbol: str, direction: str, momentum: float, price: float):
         ts = datetime.now().strftime("%H:%M:%S")
-        arrow = "🔺" if direction == "UP" else "🔻"
+        arrow = "📈" if direction == "UP" else "📉"
+        side = "看涨" if direction == "UP" else "看跌"
         await self.send_text(
-            f"{arrow} Signal: {direction} {symbol} "
-            f"momentum={momentum:+.2%} @ ${price:,.2f} [{ts}]"
+            f"{arrow} 信号：{side} {symbol} "
+            f"偏离 {momentum:+.2%} 当前价 ${price:,.2f} [{ts}]"
         )
 
     async def send_startup(self, mode: str, symbols: list[str]):
-        sym_str = ", ".join(symbols)
-        await self.send_markdown(
-            "Pipeline Started",
-            f"**{self._keyword} Pipeline Started**\n\n"
-            f"- Mode: **{mode}**\n"
-            f"- Symbols: {sym_str}\n"
-            f"- Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n",
+        sym_str = "、".join(symbols)
+        mode_cn = "模拟交易" if mode == "PAPER" else "实盘交易"
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        text = (
+            f"**{self._keyword}** 🚀 **策略已启动**\n\n"
+            f"- 模式：**{mode_cn}**\n"
+            f"- 监控币种：{sym_str}\n"
+            f"- 启动时间：{ts}\n"
         )
+        await self.send_markdown(f"策略启动 {mode_cn}", text)
 
     async def _post(self, body: dict):
         try:
