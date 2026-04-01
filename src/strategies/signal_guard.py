@@ -1,14 +1,7 @@
-"""Signal guard: prevents duplicate entries on sustained moves.
+"""Signal guard: prevents duplicate entries within the same 15-min window.
 
-During a sustained BTC rally, the momentum detector fires multiple times.
-Without the guard, the bot would open 3 positions on what is effectively one
-trade. The guard suppresses same-direction signals within a cooldown window
-while allowing immediate entry on direction reversals.
-
-Cooldown calibration (5-min markets):
-  < 60s  → stacks positions on single move (too aggressive)
-  120s   → prevents stacking, allows genuine reversals  ← default
-  > 180s → suppresses legitimate second signals in volatile markets
+Keyed by market slug (unique per window per asset), so switching to a new
+15-min window automatically resets the guard for that asset.
 """
 
 from __future__ import annotations
@@ -19,7 +12,7 @@ from src.strategies.momentum import Direction, Signal
 
 
 class SignalGuard:
-    """Per-symbol cooldown-based signal deduplication."""
+    """One trade per direction per 15-min window, with configurable cooldown."""
 
     def __init__(self, cooldown_secs: float = 120):
         self._cooldown = cooldown_secs
@@ -27,7 +20,7 @@ class SignalGuard:
         self.suppressed_count = 0
 
     def should_trade(self, signal: Signal) -> bool:
-        key = signal.symbol
+        key = signal.market.slug
         now = signal.timestamp or time.time()
 
         if key in self._last:

@@ -17,8 +17,8 @@ if TYPE_CHECKING:
     from src.main import Pipeline
 
 
-def _truncate(s: str, max_len: int = 50) -> str:
-    return s[: max_len - 2] + ".." if len(s) > max_len else s
+def _trunc(s: str, n: int = 50) -> str:
+    return s[: n - 2] + ".." if len(s) > n else s
 
 
 def build_prices_panel(pipeline: Pipeline) -> Panel:
@@ -26,99 +26,116 @@ def build_prices_panel(pipeline: Pipeline) -> Panel:
     for symbol in sorted(pipeline.last_prices):
         price = pipeline.last_prices[symbol]
         label = symbol.upper().replace("USDT", "")
-        text.append(f"  {label:<5}", style="bold cyan")
-        text.append(f"${price:>10,.2f}\n", style="white")
+
+        market = pipeline.registry.get_market(symbol)
+        open_str = ""
+        dev_str = ""
+        if market and market.has_opening_price:
+            op = market.opening_price
+            dev = (price - op) / op
+            open_str = f"  open ${op:>10,.2f}"
+            style = "green" if dev >= 0 else "red"
+            dev_str = f"  [{style}]{dev:+.2%}[/{style}]"
+
+        text.append(f"  {label:<4}", style="bold cyan")
+        text.append(f"${price:>10,.2f}")
+        if open_str:
+            text.append(open_str, style="dim")
+        if dev_str:
+            text.append_text(Text.from_markup(dev_str))
+        text.append("\n")
+
     if not pipeline.last_prices:
         text.append("  Connecting to Binance...", style="dim")
-    return Panel(text, title="Prices (Binance)", border_style="cyan")
+    return Panel(text, title="Prices (Binance vs Open)", border_style="cyan")
 
 
 def build_signals_table(pipeline: Pipeline) -> Table:
     table = Table(title="Signals", expand=True, border_style="yellow")
     table.add_column("Time", width=8)
-    table.add_column("Sym", width=5)
+    table.add_column("Sym", width=4)
     table.add_column("Dir", width=5)
-    table.add_column("Price", width=11, justify="right")
-    table.add_column("Move", width=8, justify="right")
+    table.add_column("Now", width=11, justify="right")
+    table.add_column("Open", width=11, justify="right")
+    table.add_column("Dev", width=7, justify="right")
 
     for sig in reversed(pipeline.signals[-12:]):
         ts = datetime.fromtimestamp(sig.timestamp).strftime("%H:%M:%S")
         is_up = sig.direction.value == "UP"
         style = "green" if is_up else "red"
-        sym = sig.symbol.upper().replace("USDT", "")
         table.add_row(
             ts,
-            sym,
+            sig.asset,
             Text(sig.direction.value, style=f"bold {style}"),
-            f"${sig.price:,.2f}",
-            Text(f"{sig.momentum_pct:+.2%}", style=style),
+            f"${sig.current_price:,.2f}",
+            f"${sig.opening_price:,.2f}",
+            Text(f"{sig.deviation_pct:+.2%}", style=style),
         )
     if not pipeline.signals:
-        table.add_row("", "", Text("waiting...", style="dim"), "", "")
+        table.add_row("", "", Text("waiting...", style="dim"), "", "", "")
     return table
 
 
 def build_trades_table(pipeline: Pipeline) -> Table:
     table = Table(title="Trades", expand=True, border_style="green")
     table.add_column("Time", width=8)
-    table.add_column("Sym", width=5)
-    table.add_column("Dir", width=5)
+    table.add_column("Sym", width=4)
+    table.add_column("Side", width=5)
     table.add_column("Price", width=7, justify="right")
     table.add_column("Shares", width=7, justify="right")
     table.add_column("Cost", width=9, justify="right")
-    table.add_column("Market", width=38)
+    table.add_column("Dev", width=7, justify="right")
     table.add_column("", width=6)
 
-    for trade in reversed(pipeline.executor.recent_trades[-12:]):
-        ts = datetime.fromtimestamp(trade.timestamp).strftime("%H:%M:%S")
-        is_up = trade.direction == "UP"
+    for t in reversed(pipeline.executor.recent_trades[-12:]):
+        ts = datetime.fromtimestamp(t.timestamp).strftime("%H:%M:%S")
+        is_up = t.direction == "UP"
         style = "green" if is_up else "red"
-        mode = Text("PAPER", style="yellow") if trade.is_paper else Text("LIVE", style="bold red")
-        sym = trade.signal.symbol.upper().replace("USDT", "")
+        mode = Text("PAPER", style="yellow") if t.is_paper else Text("LIVE", style="bold red")
         table.add_row(
             ts,
-            sym,
-            Text(trade.direction, style=f"bold {style}"),
-            f"${trade.price:.3f}",
-            f"{trade.shares:.1f}",
-            f"${trade.cost_usd:.2f}",
-            _truncate(trade.market.question, 38),
+            t.signal.asset,
+            Text(t.token_side, style=f"bold {style}"),
+            f"${t.price:.3f}",
+            f"{t.shares:.1f}",
+            f"${t.cost_usd:.2f}",
+            Text(f"{t.signal.deviation_pct:+.2%}", style=style),
             mode,
         )
     if not pipeline.executor.recent_trades:
-        table.add_row("", "", "", "", "", "", Text("no trades yet", style="dim"), "")
+        table.add_row("", "", "", "", "", "", Text("no trades", style="dim"), "")
     return table
 
 
 def build_markets_table(pipeline: Pipeline) -> Table:
-    table = Table(title="Active Markets", expand=True, border_style="magenta")
-    table.add_column("Sym", width=5)
-    table.add_column("Dir", width=5)
-    table.add_column("YES", width=7, justify="right")
-    table.add_column("NO", width=7, justify="right")
+    table = Table(title="15-Min Markets", expand=True, border_style="magenta")
+    table.add_column("Sym", width=4)
+    table.add_column("Up", width=6, justify="right")
+    table.add_column("Down", width=6, justify="right")
+    table.add_column("Open", width=11, justify="right")
     table.add_column("Left", width=7, justify="right")
-    table.add_column("Question", width=45)
+    table.add_column("Liq", width=9, justify="right")
 
-    markets = sorted(pipeline.registry.all_markets, key=lambda m: m.secs_remaining)
-    for m in markets:
+    for m in pipeline.registry.all_markets:
         secs = m.secs_remaining
         if secs < 5:
             continue
-        sym = m.symbol.upper().replace("USDT", "")
-        dir_style = "green" if m.direction == "UP" else "red"
+        sym = m.asset.upper()
         mins, sec = divmod(int(secs), 60)
         remaining = f"{mins}m{sec:02d}s"
         time_style = "bold red" if secs < 60 else "yellow" if secs < 180 else "dim"
+        open_str = f"${m.opening_price:,.2f}" if m.has_opening_price else "waiting..."
+        open_style = "white" if m.has_opening_price else "dim"
         table.add_row(
             sym,
-            Text(m.direction, style=dir_style),
-            f"${m.yes_price:.3f}",
-            f"${m.no_price:.3f}",
+            f"${m.up_price:.3f}",
+            f"${m.down_price:.3f}",
+            Text(open_str, style=open_style),
             Text(remaining, style=time_style),
-            _truncate(m.question, 45),
+            f"${m.liquidity:,.0f}",
         )
-    if not markets:
-        table.add_row("", "", "", "", "", Text("scanning...", style="dim"))
+    if not pipeline.registry.all_markets:
+        table.add_row("", "", "", "", Text("scanning...", style="dim"), "")
     return table
 
 
@@ -181,24 +198,20 @@ def build_dashboard(pipeline: Pipeline) -> Layout:
     layout = Layout()
     layout.split_column(
         Layout(name="header", size=3),
-        Layout(name="top", size=14),
+        Layout(name="top", size=12),
         Layout(name="middle"),
         Layout(name="bottom", size=14),
     )
 
     layout["header"].update(
         Panel(
-            Text(
-                "PolyArbitrage — Latency Arb Pipeline",
-                style="bold white on blue",
-                justify="center",
-            ),
+            Text("PolyArbitrage — Latency Arb", style="bold white on blue", justify="center"),
             border_style="blue",
         )
     )
 
     layout["top"].split_row(
-        Layout(name="prices", ratio=1),
+        Layout(name="prices", ratio=2),
         Layout(name="markets", ratio=3),
     )
     layout["prices"].update(build_prices_panel(pipeline))

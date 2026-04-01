@@ -1,19 +1,19 @@
-"""Rolling-window momentum detector for Binance tick data.
+"""Price-vs-opening comparator for 15-min crypto markets.
 
-Maintains a 60-second deque of price ticks per symbol and fires a signal
-when net price movement exceeds the threshold (default 0.3%).
+Replaces the rolling-window momentum detector. Instead of detecting "price
+moved 0.3% in the last 60 seconds" (indirect), we directly compare the
+current Binance price to the market's recorded opening price (direct).
 
-Calibration notes (BTC):
-  0.15% / 30s  → 15-20 signals/day, mostly noise
-  0.3%  / 60s  → 3-8 signals/day, ~62% directional accuracy  ← default
-  0.5%  / 60s  → 0-2 signals/day, too infrequent
+This answers the exact question the market asks:
+  "Will BTC be higher at the end of this 15-min window?"
 """
 
 from __future__ import annotations
 
-from collections import deque
 from dataclasses import dataclass
 from enum import Enum
+
+from src.data.market_registry import CryptoMarket, MarketRegistry
 
 
 class Direction(str, Enum):
@@ -23,52 +23,61 @@ class Direction(str, Enum):
 
 @dataclass
 class Signal:
-    symbol: str
+    asset: str
+    binance_symbol: str
     direction: Direction
-    price: float
-    momentum_pct: float
+    current_price: float
+    opening_price: float
+    deviation_pct: float
+    market: CryptoMarket
     timestamp: float
 
 
-class MomentumDetector:
-    """Per-symbol rolling window momentum detector."""
+class PriceComparator:
+    """Generates signals by comparing current Binance price to the market opening price."""
 
-    def __init__(self, threshold_pct: float = 0.003, window_secs: float = 60):
+    def __init__(
+        self,
+        registry: MarketRegistry,
+        threshold_pct: float = 0.003,
+        min_secs_remaining: float = 30,
+        min_secs_elapsed: float = 30,
+    ):
+        self._registry = registry
         self._threshold = threshold_pct
-        self._window_secs = window_secs
-        self._windows: dict[str, deque[tuple[float, float]]] = {}
+        self._min_remaining = min_secs_remaining
+        self._min_elapsed = min_secs_elapsed
 
-    def update(self, symbol: str, timestamp: float, price: float) -> Signal | None:
-        if symbol not in self._windows:
-            self._windows[symbol] = deque()
-
-        window = self._windows[symbol]
-        window.append((timestamp, price))
-
-        cutoff = timestamp - self._window_secs
-        while window and window[0][0] < cutoff:
-            window.popleft()
-
-        if len(window) < 2:
+    def check(self, binance_symbol: str, price: float, timestamp: float) -> Signal | None:
+        market = self._registry.get_market(binance_symbol)
+        if not market:
             return None
 
-        oldest_price = window[0][1]
-        pct_move = (price - oldest_price) / oldest_price
+        if not market.has_opening_price:
+            return None
 
-        if pct_move >= self._threshold:
-            return Signal(
-                symbol=symbol,
-                direction=Direction.UP,
-                price=price,
-                momentum_pct=pct_move,
-                timestamp=timestamp,
-            )
-        if pct_move <= -self._threshold:
-            return Signal(
-                symbol=symbol,
-                direction=Direction.DOWN,
-                price=price,
-                momentum_pct=pct_move,
-                timestamp=timestamp,
-            )
-        return None
+        if market.secs_remaining < self._min_remaining:
+            return None
+
+        if market.secs_elapsed < self._min_elapsed:
+            return None
+
+        deviation = (price - market.opening_price) / market.opening_price
+
+        if deviation >= self._threshold:
+            direction = Direction.UP
+        elif deviation <= -self._threshold:
+            direction = Direction.DOWN
+        else:
+            return None
+
+        return Signal(
+            asset=market.asset.upper(),
+            binance_symbol=binance_symbol,
+            direction=direction,
+            current_price=price,
+            opening_price=market.opening_price,
+            deviation_pct=deviation,
+            market=market,
+            timestamp=timestamp,
+        )

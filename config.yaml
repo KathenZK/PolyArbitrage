@@ -1,23 +1,23 @@
 strategy:
   symbols: ["btcusdt", "ethusdt", "solusdt"]
 
-  # Momentum detector: 0.3% move in 60s window triggers signal
-  momentum_threshold_pct: 0.003
-  momentum_window_sec: 60
+  # Signal: trigger when Binance price deviates from 15-min opening price
+  edge_threshold_pct: 0.003        # 0.3% deviation from opening price
+  min_secs_remaining: 30           # skip markets with < 30s left
+  min_secs_elapsed: 30             # wait 30s after window opens before trading
 
-  # Signal guard: suppress same-direction duplicates within cooldown
+  # Signal guard: one trade per direction per 15-min window
   signal_cooldown_sec: 120
 
   # Execution
-  bet_size_usd: 15              # USD per trade
-  min_secs_remaining: 30        # skip markets expiring within this window
+  bet_size_usd: 15                 # USD per trade
 
-  # Market registry
-  registry_refresh_sec: 30      # how often to rescan Polymarket for new markets
+  # Market registry: how often to re-fetch market data from Polymarket
+  registry_refresh_sec: 15
 
 risk:
-  dry_run: true                 # true = paper trading, false = real money
+  dry_run: true                    # true = paper trading, false = real money
 
 alerts:
   dingtalk_webhook: "https://oapi.dingtalk.com/robot/send?access_token=274c97076883209c4651bfa37c1312e23b3d58329fbc5a8e90307be7662bbe1b"
-  dingtalk_keyword: "PolyGod"   # must match the custom keyword in DingTalk robot settings
+  dingtalk_keyword: "PolyGod"

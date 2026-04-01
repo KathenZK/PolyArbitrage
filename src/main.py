@@ -1,10 +1,12 @@
 """PolyArbitrage — Binance-Polymarket latency arbitrage pipeline.
 
-Architecture (4 stages):
-  Binance aggTrade WS → MomentumDetector → SignalGuard → CLOB Executor
+Architecture:
+  Binance aggTrade WS  →  PriceComparator (vs opening price)  →  SignalGuard  →  Executor
+  MarketRegistry (slug-based 15-min market discovery, opening price tracking)
 
-The pipeline exploits the 30-90 second price lag between Binance spot moves
-and Polymarket 15-minute crypto market repricing.
+The pipeline detects when the current Binance price deviates from the 15-min
+market's opening price, then buys the Up or Down token before Polymarket
+market makers fully reprice.
 """
 
 from __future__ import annotations
@@ -26,13 +28,13 @@ load_dotenv()
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.data.binance_stream import BinanceStream, Tick
-from src.data.market_registry import MarketRegistry
+from src.data.market_registry import MarketRegistry, current_window_start
 from src.data.polymarket_client import PolymarketGammaClient
 from src.output.alerts import DingTalkAlert
 from src.output.dashboard import build_dashboard
 from src.output.db import get_connection, init_db
 from src.strategies.executor import Executor
-from src.strategies.momentum import MomentumDetector, Signal
+from src.strategies.momentum import PriceComparator, Signal
 from src.strategies.signal_guard import SignalGuard
 
 console = Console()
@@ -46,29 +48,32 @@ def load_config() -> dict:
 
 
 class Pipeline:
-    """Wires Binance stream -> Momentum -> Guard -> Executor into a single async loop."""
+    """Wires Binance stream → PriceComparator → SignalGuard → Executor."""
 
     def __init__(self, config: dict):
         self.config = config
         strat = config.get("strategy", {})
 
+        assets = [a.replace("usdt", "") for a in strat.get("symbols", ["btcusdt", "ethusdt", "solusdt"])]
+
         self.gamma = PolymarketGammaClient()
         self.registry = MarketRegistry(
             self.gamma,
-            refresh_interval=strat.get("registry_refresh_sec", 30),
+            assets=assets,
+            refresh_interval=strat.get("registry_refresh_sec", 15),
         )
-        self.detector = MomentumDetector(
-            threshold_pct=strat.get("momentum_threshold_pct", 0.003),
-            window_secs=strat.get("momentum_window_sec", 60),
+        self.comparator = PriceComparator(
+            registry=self.registry,
+            threshold_pct=strat.get("edge_threshold_pct", 0.003),
+            min_secs_remaining=strat.get("min_secs_remaining", 30),
+            min_secs_elapsed=strat.get("min_secs_elapsed", 30),
         )
         self.guard = SignalGuard(
             cooldown_secs=strat.get("signal_cooldown_sec", 120),
         )
         self.executor = Executor(
-            registry=self.registry,
             bet_size_usd=strat.get("bet_size_usd", 15),
             dry_run=config.get("risk", {}).get("dry_run", True),
-            min_secs_remaining=strat.get("min_secs_remaining", 30),
         )
 
         alert_cfg = config.get("alerts", {})
@@ -91,7 +96,9 @@ class Pipeline:
         self.ticks_count += 1
         self.last_prices[tick.symbol] = tick.price
 
-        signal = self.detector.update(tick.symbol, tick.timestamp, tick.price)
+        self.registry.record_opening_price(tick.symbol, tick.price)
+
+        signal = self.comparator.check(tick.symbol, tick.price, tick.timestamp)
         if signal is None:
             return
 
@@ -110,17 +117,17 @@ class Pipeline:
         try:
             result = await self.executor.execute(signal)
             if result:
-                sym = signal.symbol.replace("usdt", "").upper()
                 logger.info(
-                    f"Trade #{result.order_id}: {result.direction} {sym} ${result.cost_usd:.2f}"
+                    f"Trade #{result.order_id}: {result.direction} {signal.asset} "
+                    f"buy {result.token_side} ${result.cost_usd:.2f}"
                 )
                 await self.alerts.send_trade(
-                    symbol=sym,
+                    symbol=signal.asset,
                     direction=result.direction,
                     price=result.price,
                     shares=result.shares,
                     cost=result.cost_usd,
-                    momentum=signal.momentum_pct,
+                    momentum=signal.deviation_pct,
                     market_question=result.market.question,
                     is_paper=result.is_paper,
                     order_id=result.order_id,
@@ -165,13 +172,12 @@ class Pipeline:
             stream_task.cancel()
 
     async def run_headless(self):
-        """Run without dashboard — useful for background/server deployment."""
         conn = get_connection()
         init_db(conn)
         conn.close()
 
         self.start_time = time.time()
-        logger.info("Pipeline started (headless mode)")
+        logger.info("Pipeline started (headless)")
 
         registry_task = asyncio.create_task(self.registry.run())
         await self.registry.refresh()
