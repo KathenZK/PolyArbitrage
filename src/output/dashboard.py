@@ -153,8 +153,10 @@ def build_status_panel(pipeline: Pipeline) -> Panel:
     text.append(f" Passed:   {pipeline.guards_passed:>10}\n")
     text.append(f" SkipLiq:  {pipeline.executor.skipped_low_liq:>10}\n")
     text.append(f" SkipEV:   {pipeline.executor.skipped_low_ev:>10}\n")
-    text.append(f" Trades:   {pipeline.executor.trade_count:>10}\n")
-    text.append(f" Spent:    ${pipeline.executor.total_cost:>9,.2f}\n")
+    text.append(f" Pending:  {pipeline.executor.pending_count:>10}\n")
+    text.append(f" Filled:   {pipeline.executor.trade_count:>10}\n")
+    text.append(f" Filled$:  ${pipeline.executor.total_cost:>9,.2f}\n")
+    text.append(f" Commit$:  ${pipeline.executor.total_committed:>9,.2f}\n")
     text.append(" Mode:     ", style="bold")
     if pipeline.config.get("risk", {}).get("dry_run", True):
         text.append("PAPER", style="bold yellow")

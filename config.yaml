@@ -22,5 +22,5 @@ risk:
   dry_run: true                    # true = paper trading, false = real money
 
 alerts:
-  dingtalk_webhook: "https://oapi.dingtalk.com/robot/send?access_token=274c97076883209c4651bfa37c1312e23b3d58329fbc5a8e90307be7662bbe1b"
+  dingtalk_webhook: ""              # set via DINGTALK_WEBHOOK env var
   dingtalk_keyword: "PolyGod"

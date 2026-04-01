@@ -1,7 +1,14 @@
 """Order executor: limit orders (maker, 0% fee) on Polymarket CLOB.
 
-Buys the Up token on UP signals, Down token on DOWN signals.
-Includes fee-aware EV check, liquidity guard, and maker price optimization.
+Order lifecycle:
+  1. Signal arrives → pre-checks (liquidity, EV)
+  2. Place post-only limit order with GTD expiration
+  3. Record as PENDING (not counted as a trade yet)
+  4. In paper mode: immediately mark as FILLED for simulation
+  5. In live mode: order starts as 'live' on the book; actual fill
+     tracking requires polling or WebSocket (not yet implemented —
+     live orders are recorded as PENDING with the order_id for
+     external monitoring)
 """
 
 from __future__ import annotations
@@ -9,7 +16,8 @@ from __future__ import annotations
 import logging
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from enum import Enum
 
 from src.data.market_registry import CryptoMarket
 from src.output.db import get_connection, insert_trade
@@ -20,6 +28,13 @@ logger = logging.getLogger(__name__)
 
 def calc_taker_fee(shares: float, price: float, fee_rate: float = 0.072) -> float:
     return shares * fee_rate * price * (1 - price)
+
+
+class OrderStatus(str, Enum):
+    PENDING = "pending"
+    FILLED = "filled"
+    REJECTED = "rejected"
+    EXPIRED = "expired"
 
 
 @dataclass
@@ -35,12 +50,13 @@ class TradeResult:
     order_id: str
     is_paper: bool
     timestamp: float
+    status: OrderStatus = OrderStatus.PENDING
     gross_ev: float = 0.0
     taker_fee_avoided: float = 0.0
 
 
 class Executor:
-    """Places limit orders (maker) with fee-aware EV check and liquidity guard."""
+    """Places limit orders (maker) with proper lifecycle tracking."""
 
     def __init__(
         self,
@@ -56,19 +72,25 @@ class Executor:
         self._min_ev = min_ev_usd
         self._maker_offset = maker_offset_ticks * 0.01
         self._clob = None
-        self._trade_count = 0
-        self._total_cost = 0.0
+        self._orders: list[TradeResult] = []
         self._skipped_low_liq = 0
         self._skipped_low_ev = 0
-        self._results: list[TradeResult] = []
 
     @property
     def trade_count(self) -> int:
-        return self._trade_count
+        return sum(1 for o in self._orders if o.status == OrderStatus.FILLED)
+
+    @property
+    def pending_count(self) -> int:
+        return sum(1 for o in self._orders if o.status == OrderStatus.PENDING)
 
     @property
     def total_cost(self) -> float:
-        return self._total_cost
+        return sum(o.cost_usd for o in self._orders if o.status == OrderStatus.FILLED)
+
+    @property
+    def total_committed(self) -> float:
+        return sum(o.cost_usd for o in self._orders if o.status in (OrderStatus.PENDING, OrderStatus.FILLED))
 
     @property
     def skipped_low_liq(self) -> int:
@@ -80,7 +102,7 @@ class Executor:
 
     @property
     def recent_trades(self) -> list[TradeResult]:
-        return list(self._results[-50:])
+        return list(self._orders[-50:])
 
     def _ensure_clob(self):
         if self._clob is None:
@@ -95,7 +117,6 @@ class Executor:
     async def execute(self, signal: Signal) -> TradeResult | None:
         market = signal.market
 
-        # --- Liquidity check ---
         if market.liquidity < self._min_liquidity:
             self._skipped_low_liq += 1
             logger.debug(
@@ -104,7 +125,6 @@ class Executor:
             )
             return None
 
-        # --- Token selection ---
         if signal.direction == Direction.UP:
             token_id = market.up_token_id
             token_price = market.up_price
@@ -121,13 +141,6 @@ class Executor:
         if shares < market.order_min_size:
             return None
 
-        cost = shares * token_price
-
-        # --- Fee-aware EV check ---
-        # Gross EV = deviation × bet (how much edge we have)
-        # We compare against what the taker fee WOULD be, as a sanity check:
-        # even though we use maker orders (0% fee), if our edge is smaller
-        # than the taker fee, the signal is too weak to be reliable.
         taker_fee = calc_taker_fee(shares, token_price, market.fee_rate)
         gross_ev = abs(signal.deviation_pct) * self._bet_size
 
@@ -139,11 +152,18 @@ class Executor:
             )
             return None
 
-        # --- Maker price: offset from mid to stay on the book ---
-        # Place BUY limit slightly below mid-price to avoid crossing the
-        # spread and becoming a taker.  If best_bid is available from
-        # Gamma API, use it; otherwise subtract one tick from mid.
-        if signal.direction == Direction.UP:
+        # In live mode, fetch real-time best bid from CLOB instead of stale Gamma data
+        live_bid = 0.0
+        if not self._dry_run:
+            try:
+                clob = self._ensure_clob()
+                live_bid = clob.get_price(token_id, "buy")
+            except Exception as e:
+                logger.debug(f"CLOB price fetch failed, using Gamma: {e}")
+
+        if live_bid > 0:
+            maker_price = round(live_bid, 2)
+        elif signal.direction == Direction.UP:
             maker_price = market.best_bid if market.best_bid > 0 else token_price - self._maker_offset
         else:
             down_best_bid = (1 - market.best_ask) if market.best_ask > 0 else token_price - self._maker_offset
@@ -152,11 +172,11 @@ class Executor:
         maker_price = round(max(0.01, min(0.99, maker_price)), 2)
         shares_at_maker = self._bet_size / maker_price if maker_price > 0 else shares
 
-        # GTD expiration: auto-cancel at window end (+ 60s security buffer)
         expiration = int(market.end_time) + 60 if market.end_time > 0 else 0
 
         if self._dry_run:
-            order_id = f"paper-{self._trade_count + 1}"
+            order_id = f"paper-{len(self._orders) + 1}"
+            status = OrderStatus.FILLED
             logger.info(
                 f"[PAPER] {signal.asset} {signal.direction.value} → buy {token_side} "
                 f"@ ${maker_price:.2f} x {shares_at_maker:.1f} = ${self._bet_size:.2f} "
@@ -174,23 +194,28 @@ class Executor:
                     expiration=expiration,
                     post_only=True,
                 )
-                order_id = str(result.get("orderID", "")) if isinstance(result, dict) else str(result)
-                status = result.get("status", "") if isinstance(result, dict) else ""
-                if not order_id or order_id == "None":
-                    err = result.get("errorMsg", "") if isinstance(result, dict) else str(result)
-                    logger.warning(f"Order rejected: {err}")
+                resp = result if isinstance(result, dict) else {}
+                order_id = resp.get("orderID", "")
+                resp_status = resp.get("status", "")
+                err = resp.get("errorMsg", "")
+
+                if not order_id:
+                    logger.warning(f"Order rejected: {err or resp}")
                     return None
+
+                if resp_status == "matched":
+                    status = OrderStatus.FILLED
+                else:
+                    status = OrderStatus.PENDING
+
                 logger.info(
                     f"[LIVE] {signal.asset} {signal.direction.value} → buy {token_side} "
                     f"@ ${maker_price:.2f} x {shares_at_maker:.1f} "
-                    f"order={order_id} status={status}"
+                    f"order={order_id} status={resp_status}"
                 )
             except Exception as e:
                 logger.error(f"Order failed: {e}")
                 return None
-
-        self._trade_count += 1
-        self._total_cost += cost
 
         trade = TradeResult(
             signal=signal,
@@ -204,10 +229,11 @@ class Executor:
             order_id=order_id,
             is_paper=self._dry_run,
             timestamp=time.time(),
+            status=status,
             gross_ev=gross_ev,
             taker_fee_avoided=taker_fee,
         )
-        self._results.append(trade)
+        self._orders.append(trade)
 
         try:
             conn = get_connection()

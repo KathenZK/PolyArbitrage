@@ -2,11 +2,13 @@
 
 Architecture:
   Binance aggTrade WS  →  PriceComparator (vs opening price)  →  SignalGuard  →  Executor
-  MarketRegistry (slug-based 15-min market discovery, opening price tracking)
+  MarketRegistry (slug-based, window-aligned opening price with tick buffer)
 
-The pipeline detects when the current Binance price deviates from the 15-min
-market's opening price, then buys the Up or Down token before Polymarket
-market makers fully reprice.
+Opening price tracking:
+  Every Binance tick is buffered by the registry. When a new 15-min window
+  starts, the registry picks the buffered tick closest to window start as
+  the opening price reference — using the tick's own timestamp, not the
+  local clock.
 """
 
 from __future__ import annotations
@@ -80,6 +82,8 @@ class Pipeline:
             maker_offset_ticks=strat.get("maker_offset_ticks", 1),
         )
 
+        self.registry.register_window_change_callback(self.guard.on_window_change)
+
         alert_cfg = config.get("alerts", {})
         self.alerts = DingTalkAlert(
             webhook_url=alert_cfg.get("dingtalk_webhook", "") or os.getenv("DINGTALK_WEBHOOK", ""),
@@ -100,7 +104,8 @@ class Pipeline:
         self.ticks_count += 1
         self.last_prices[tick.symbol] = tick.price
 
-        self.registry.record_opening_price(tick.symbol, tick.price)
+        self.registry.buffer_tick(tick.symbol, tick.price, tick.timestamp)
+        self.registry.record_opening_price(tick.symbol, tick.price, tick.timestamp)
 
         signal = self.comparator.check(tick.symbol, tick.price, tick.timestamp)
         if signal is None:
