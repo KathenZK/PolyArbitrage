@@ -151,6 +151,8 @@ def build_status_panel(pipeline: Pipeline) -> Panel:
     text.append(f" Signals:  {pipeline.signals_count:>10}\n")
     text.append(f" Guarded:  {pipeline.guard.suppressed_count:>10}\n")
     text.append(f" Passed:   {pipeline.guards_passed:>10}\n")
+    text.append(f" SkipLiq:  {pipeline.executor.skipped_low_liq:>10}\n")
+    text.append(f" SkipEV:   {pipeline.executor.skipped_low_ev:>10}\n")
     text.append(f" Trades:   {pipeline.executor.trade_count:>10}\n")
     text.append(f" Spent:    ${pipeline.executor.total_cost:>9,.2f}\n")
     text.append(" Mode:     ", style="bold")

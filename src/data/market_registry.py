@@ -23,6 +23,8 @@ logger = logging.getLogger(__name__)
 
 WINDOW_SECS = 900
 
+MAX_OPENING_PRICE_DELAY = 15
+
 ASSETS: dict[str, str] = {
     "btc": "btcusdt",
     "eth": "ethusdt",
@@ -48,13 +50,17 @@ class CryptoMarket:
     down_token_id: str
     up_price: float
     down_price: float
+    best_bid: float
+    best_ask: float
     event_start: int
     end_time: float
     opening_price: float = 0.0
     volume: float = 0.0
     liquidity: float = 0.0
+    spread: float = 0.0
     fees_enabled: bool = True
     fee_rate: float = 0.072
+    order_min_size: int = 5
 
     @property
     def secs_remaining(self) -> float:
@@ -68,6 +74,12 @@ class CryptoMarket:
     def has_opening_price(self) -> bool:
         return self.opening_price > 0
 
+    def taker_fee(self, shares: float, price: float) -> float:
+        """Polymarket taker fee: C × feeRate × p × (1-p)"""
+        if not self.fees_enabled:
+            return 0.0
+        return shares * self.fee_rate * price * (1 - price)
+
 
 class MarketRegistry:
     """Discovers active 15-min crypto markets via slug pattern and tracks opening prices."""
@@ -77,10 +89,12 @@ class MarketRegistry:
         gamma: PolymarketGammaClient,
         assets: list[str] | None = None,
         refresh_interval: float = 15,
+        min_liquidity: float = 1000,
     ):
         self._gamma = gamma
         self._assets = assets or ["btc", "eth", "sol"]
         self._refresh_interval = refresh_interval
+        self._min_liquidity = min_liquidity
         self._markets: dict[str, CryptoMarket] = {}
         self._running = False
         self._last_window_start = 0
@@ -100,13 +114,19 @@ class MarketRegistry:
     def get_market(self, binance_symbol: str) -> CryptoMarket | None:
         return self._markets.get(binance_symbol)
 
-    def record_opening_price(self, binance_symbol: str, price: float):
-        """Called on the first tick after a new window starts."""
+    def record_opening_price(self, binance_symbol: str, price: float, timestamp: float = 0):
+        """Record opening price only if we caught the window start (within first 15s)."""
         market = self._markets.get(binance_symbol)
-        if market and not market.has_opening_price:
-            market.opening_price = price
-            sym = market.asset.upper()
-            logger.info(f"Opening price: {sym} = ${price:,.2f} (window {market.event_start})")
+        if not market or market.has_opening_price:
+            return
+
+        elapsed = market.secs_elapsed
+        if elapsed > MAX_OPENING_PRICE_DELAY:
+            return
+
+        market.opening_price = price
+        sym = market.asset.upper()
+        logger.info(f"Opening price: {sym} = ${price:,.2f} ({elapsed:.1f}s into window)")
 
     async def refresh(self):
         ws = current_window_start()
@@ -146,7 +166,8 @@ class MarketRegistry:
             for m in active:
                 sym = m.asset.upper()
                 op = f"${m.opening_price:,.2f}" if m.has_opening_price else "?"
-                parts.append(f"{sym}(open={op})")
+                liq_warn = " LOW-LIQ" if m.liquidity < self._min_liquidity else ""
+                parts.append(f"{sym}(open={op} liq=${m.liquidity:,.0f}{liq_warn})")
             logger.info(f"Registry: {', '.join(parts)}")
 
         if new_window:
@@ -224,12 +245,16 @@ class MarketRegistry:
             down_token_id=tokens[1],
             up_price=prices[0] if prices else 0.5,
             down_price=prices[1] if len(prices) > 1 else 0.5,
+            best_bid=float(m.get("bestBid", 0) or 0),
+            best_ask=float(m.get("bestAsk", 0) or 0),
             event_start=window_start,
             end_time=end_ts,
             volume=float(m.get("volume", 0) or 0),
             liquidity=float(m.get("liquidity", 0) or 0),
+            spread=float(m.get("spread", 0) or 0),
             fees_enabled=bool(m.get("feesEnabled", True)),
             fee_rate=fee_sched.get("rate", 0.072) if fee_sched else 0.072,
+            order_min_size=int(m.get("orderMinSize", 5) or 5),
         )
 
     async def run(self):

@@ -61,6 +61,7 @@ class Pipeline:
             self.gamma,
             assets=assets,
             refresh_interval=strat.get("registry_refresh_sec", 15),
+            min_liquidity=strat.get("min_liquidity", 1000),
         )
         self.comparator = PriceComparator(
             registry=self.registry,
@@ -74,6 +75,9 @@ class Pipeline:
         self.executor = Executor(
             bet_size_usd=strat.get("bet_size_usd", 15),
             dry_run=config.get("risk", {}).get("dry_run", True),
+            min_liquidity=strat.get("min_liquidity", 1000),
+            min_ev_usd=strat.get("min_ev_usd", 0.10),
+            maker_offset_ticks=strat.get("maker_offset_ticks", 1),
         )
 
         alert_cfg = config.get("alerts", {})

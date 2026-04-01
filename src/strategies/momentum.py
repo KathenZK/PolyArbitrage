@@ -1,11 +1,14 @@
 """Price-vs-opening comparator for 15-min crypto markets.
 
-Replaces the rolling-window momentum detector. Instead of detecting "price
-moved 0.3% in the last 60 seconds" (indirect), we directly compare the
-current Binance price to the market's recorded opening price (direct).
-
-This answers the exact question the market asks:
+Directly compares the current Binance price to the market's recorded opening
+price. This answers the exact question the market asks:
   "Will BTC be higher at the end of this 15-min window?"
+
+Skips signals when:
+  - No opening price recorded (bot started mid-window, > 15s after open)
+  - Market expiring within min_secs_remaining
+  - Window too young (< min_secs_elapsed, price not yet stable)
+  - Deviation below threshold
 """
 
 from __future__ import annotations

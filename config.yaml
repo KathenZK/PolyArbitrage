@@ -11,6 +11,9 @@ strategy:
 
   # Execution
   bet_size_usd: 15                 # USD per trade
+  min_liquidity: 1000              # skip markets with less liquidity
+  min_ev_usd: 0.10                 # skip trades where gross EV < this
+  maker_offset_ticks: 1            # ticks below mid to ensure maker status
 
   # Market registry: how often to re-fetch market data from Polymarket
   registry_refresh_sec: 15
