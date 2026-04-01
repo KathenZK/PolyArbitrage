@@ -139,6 +139,23 @@ class Pipeline:
         except Exception as e:
             logger.error(f"Execution error: {e}")
 
+    async def _check_geoblock(self):
+        try:
+            geo = await self.gamma.check_geoblock()
+            blocked = geo.get("blocked", False)
+            country = geo.get("country", "?")
+            ip = geo.get("ip", "?")
+            if blocked:
+                console.print(f"[bold red]BLOCKED: IP {ip} in {country} — trading not allowed[/bold red]")
+                console.print("Use a VPN to a non-blocked region, or switch to paper mode.")
+                return False
+            console.print(f"  Geo:     {country} ({ip}) — [green]OK[/green]")
+            return True
+        except Exception as e:
+            logger.warning(f"Geoblock check failed: {e} (proceeding anyway)")
+            console.print(f"  Geo:     check failed — proceeding")
+            return True
+
     async def run(self):
         conn = get_connection()
         init_db(conn)
@@ -152,6 +169,14 @@ class Pipeline:
         console.print(f"  Mode:    {'PAPER' if dry_run else '[bold red]LIVE[/bold red]'}")
         console.print(f"  Symbols: {[s.replace('usdt','').upper() for s in symbols]}")
         console.print(f"  Bet:     ${self.config.get('strategy', {}).get('bet_size_usd', 15)}/trade")
+
+        if not dry_run:
+            geo_ok = await self._check_geoblock()
+            if not geo_ok:
+                return
+        else:
+            console.print(f"  Geo:     skipped (paper mode)")
+
         console.print()
 
         registry_task = asyncio.create_task(self.registry.run())

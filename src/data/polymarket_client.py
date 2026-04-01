@@ -1,8 +1,13 @@
-"""Polymarket API clients: Gamma (REST) for market discovery, CLOB for trading."""
+"""Polymarket API clients: Gamma (REST) for market discovery, CLOB for trading.
+
+CLOB client uses the official py-clob-client SDK with:
+  - Post-Only orders (guarantees maker status, 0% fee)
+  - GTD expiration (auto-cancel at window end)
+  - Proper options (tick_size, neg_risk)
+"""
 
 from __future__ import annotations
 
-import json
 import logging
 from typing import Any
 
@@ -70,9 +75,18 @@ class PolymarketGammaClient:
         }
         return await self._get("/events", params)
 
+    async def check_geoblock(self) -> dict:
+        """Check if the current IP is blocked from trading."""
+        session = await self._ensure_session()
+        async with session.get(
+            "https://polymarket.com/api/geoblock",
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as r:
+            return await r.json()
+
 
 class PolymarketCLOBClient:
-    """Wrapper around py-clob-client for live trading (requires private key)."""
+    """Wrapper around py-clob-client with post-only + GTD support."""
 
     def __init__(self, private_key: str, chain_id: int = 137):
         self._key = private_key
@@ -99,27 +113,63 @@ class PolymarketCLOBClient:
         client = self._ensure_client()
         return float(client.get_price(token_id, side))
 
-    def place_market_order(self, token_id: str, side: str, size: float):
+    def place_limit_order(
+        self,
+        token_id: str,
+        side: str,
+        price: float,
+        size: float,
+        tick_size: str = "0.01",
+        neg_risk: bool = False,
+        expiration: int = 0,
+        post_only: bool = True,
+    ) -> dict:
+        """Place a limit order. Defaults to post-only GTC (guaranteed maker).
+
+        If expiration > 0, uses GTD (auto-cancel at that unix timestamp).
+        post_only=True rejects if the order would cross the spread.
+        """
         client = self._ensure_client()
+        from py_clob_client.clob_types import OrderArgs, OrderType
         from py_clob_client.order_builder.constants import BUY, SELL
 
         order_side = BUY if side.upper() == "BUY" else SELL
-        order = client.create_market_order(
-            token_id=token_id,
-            amount=size,
-            side=order_side,
-        )
-        return client.post_order(order)
 
-    def place_limit_order(self, token_id: str, side: str, price: float, size: float):
-        client = self._ensure_client()
-        from py_clob_client.order_builder.constants import BUY, SELL
-
-        order_side = BUY if side.upper() == "BUY" else SELL
-        signed = client.create_order(
+        order_args = OrderArgs(
             token_id=token_id,
             price=price,
             size=size,
             side=order_side,
+            expiration=expiration if expiration > 0 else 0,
         )
-        return client.post_order(signed)
+        options = {"tick_size": tick_size, "neg_risk": neg_risk}
+
+        order_type = OrderType.GTD if expiration > 0 else OrderType.GTC
+
+        signed = client.create_order(order_args, options=options)
+        return client.post_order(signed, order_type=order_type, post_only=post_only)
+
+    def place_market_order(
+        self,
+        token_id: str,
+        side: str,
+        amount: float,
+        worst_price: float = 0,
+        tick_size: str = "0.01",
+        neg_risk: bool = False,
+    ) -> dict:
+        """Place a FOK market order (fill entirely or cancel)."""
+        client = self._ensure_client()
+        from py_clob_client.clob_types import OrderType
+        from py_clob_client.order_builder.constants import BUY, SELL
+
+        order_side = BUY if side.upper() == "BUY" else SELL
+
+        order = client.create_market_order(
+            token_id=token_id,
+            amount=amount,
+            side=order_side,
+            price=worst_price if worst_price > 0 else None,
+            options={"tick_size": tick_size, "neg_risk": neg_risk},
+        )
+        return client.post_order(order, order_type=OrderType.FOK)

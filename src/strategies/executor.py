@@ -152,6 +152,9 @@ class Executor:
         maker_price = round(max(0.01, min(0.99, maker_price)), 2)
         shares_at_maker = self._bet_size / maker_price if maker_price > 0 else shares
 
+        # GTD expiration: auto-cancel at window end (+ 60s security buffer)
+        expiration = int(market.end_time) + 60 if market.end_time > 0 else 0
+
         if self._dry_run:
             order_id = f"paper-{self._trade_count + 1}"
             logger.info(
@@ -168,11 +171,19 @@ class Executor:
                     side="BUY",
                     price=maker_price,
                     size=round(shares_at_maker, 2),
+                    expiration=expiration,
+                    post_only=True,
                 )
-                order_id = str(result) if result else "unknown"
+                order_id = str(result.get("orderID", "")) if isinstance(result, dict) else str(result)
+                status = result.get("status", "") if isinstance(result, dict) else ""
+                if not order_id or order_id == "None":
+                    err = result.get("errorMsg", "") if isinstance(result, dict) else str(result)
+                    logger.warning(f"Order rejected: {err}")
+                    return None
                 logger.info(
                     f"[LIVE] {signal.asset} {signal.direction.value} → buy {token_side} "
-                    f"@ ${maker_price:.2f} x {shares_at_maker:.1f} order={order_id}"
+                    f"@ ${maker_price:.2f} x {shares_at_maker:.1f} "
+                    f"order={order_id} status={status}"
                 )
             except Exception as e:
                 logger.error(f"Order failed: {e}")
