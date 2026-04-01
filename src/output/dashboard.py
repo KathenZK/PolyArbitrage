@@ -77,6 +77,8 @@ def build_trades_table(pipeline: Pipeline) -> Table:
     table.add_column("Time", width=8)
     table.add_column("Sym", width=4)
     table.add_column("Side", width=5)
+    table.add_column("Stat", width=8)
+    table.add_column("Fill", width=7, justify="right")
     table.add_column("q", width=5, justify="right")
     table.add_column("p", width=5, justify="right")
     table.add_column("EV", width=6, justify="right")
@@ -89,18 +91,21 @@ def build_trades_table(pipeline: Pipeline) -> Table:
         style = "green" if is_up else "red"
         mode = Text("PAPER", style="yellow") if t.is_paper else Text("LIVE", style="bold red")
         ev_style = "green" if t.real_ev > 0 else "red"
+        status_style = "green" if t.display_status == "filled" else "yellow" if t.display_status in {"pending", "partial"} else "red"
         table.add_row(
             ts,
-            t.signal.asset,
+            t.asset,
             Text(t.token_side, style=f"bold {style}"),
+            Text(t.display_status, style=status_style),
+            f"{t.matched_ratio:.0%}",
             f"{t.price:.2f}",
             f"{t.win_prob:.0%}",
             Text(f"${t.real_ev:.2f}", style=ev_style),
-            f"${t.cost_usd:.0f}",
+            f"${t.matched_cost_usd:.0f}",
             mode,
         )
     if not pipeline.executor.recent_trades:
-        table.add_row("", "", "", "", "", "", Text("--", style="dim"), "")
+        table.add_row("", "", "", "", "", "", "", "", Text("--", style="dim"), "")
     return table
 
 
@@ -176,10 +181,11 @@ def build_status_panel(pipeline: Pipeline) -> Panel:
 
 def build_ev_panel(pipeline: Pipeline) -> Panel:
     trades = pipeline.executor.recent_trades
-    filled = [t for t in trades if t.status.value == "filled"]
-    total_ev = sum(t.real_ev for t in filled)
-    total_fee_saved = sum(t.taker_fee_avoided for t in filled)
-    avg_p = sum(t.win_prob for t in filled) / len(filled) if filled else 0
+    filled = [t for t in trades if t.matched_shares > 0 or t.status.value == "filled"]
+    total_ev = sum(t.realized_ev for t in filled)
+    total_fee_saved = sum(t.taker_fee_avoided * t.matched_ratio for t in filled)
+    matched_weight = sum(t.matched_ratio for t in filled)
+    avg_p = sum(t.win_prob * t.matched_ratio for t in filled) / matched_weight if matched_weight > 0 else 0
 
     text = Text()
     text.append(f" Filled:    {len(filled)}\n")

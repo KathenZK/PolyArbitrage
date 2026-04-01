@@ -33,6 +33,7 @@ from src.data.binance_stream import BinanceStream, Tick
 from src.data.market_registry import MarketRegistry, current_window_start
 from src.data.polymarket_client import PolymarketGammaClient
 from src.output.alerts import DingTalkAlert
+from src.output.db import get_connection, init_db
 from src.output.dashboard import build_dashboard
 from src.strategies.executor import Executor
 from src.strategies.momentum import PriceComparator, Signal
@@ -106,6 +107,7 @@ class Pipeline:
         self.guards_passed = 0
         self.last_prices: dict[str, float] = {}
         self.start_time = 0.0
+        self._db_conn = None
 
     async def _on_tick(self, tick: Tick):
         self.ticks_count += 1
@@ -151,6 +153,14 @@ class Pipeline:
         except Exception as e:
             logger.error(f"Execution error: {e}")
 
+    async def _reconcile_loop(self):
+        while True:
+            try:
+                await self.executor.reconcile_pending_orders()
+            except Exception as e:
+                logger.error(f"Reconcile error: {e}")
+            await asyncio.sleep(1.0)
+
     async def _check_geoblock(self):
         try:
             geo = await self.gamma.check_geoblock()
@@ -187,10 +197,17 @@ class Pipeline:
 
         console.print()
 
+        self._db_conn = get_connection()
+        init_db(self._db_conn)
+        self.executor.attach_db(self._db_conn)
+
         registry_task = asyncio.create_task(self.registry.run())
         await self.registry.refresh()
+        self.executor.bootstrap_pending_orders()
+        await self.executor.reconcile_pending_orders(force=True)
 
         stream_task = asyncio.create_task(self.stream.run())
+        reconcile_task = asyncio.create_task(self._reconcile_loop())
 
         await self.alerts.send_startup(
             mode="PAPER" if dry_run else "LIVE",
@@ -207,20 +224,35 @@ class Pipeline:
         finally:
             registry_task.cancel()
             stream_task.cancel()
+            reconcile_task.cancel()
 
     async def run_headless(self):
         self.start_time = time.time()
         logger.info("Pipeline started (headless)")
 
+        self._db_conn = get_connection()
+        init_db(self._db_conn)
+        self.executor.attach_db(self._db_conn)
+
         registry_task = asyncio.create_task(self.registry.run())
         await self.registry.refresh()
+        self.executor.bootstrap_pending_orders()
+        await self.executor.reconcile_pending_orders(force=True)
+        reconcile_task = asyncio.create_task(self._reconcile_loop())
 
-        await self.stream.run()
+        try:
+            await self.stream.run()
+        finally:
+            registry_task.cancel()
+            reconcile_task.cancel()
 
     async def shutdown(self):
         self.stream.stop()
         self.registry.stop()
         await self.gamma.close()
+        if self._db_conn is not None:
+            self._db_conn.close()
+            self._db_conn = None
 
 
 def main():

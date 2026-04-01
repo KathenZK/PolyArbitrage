@@ -105,40 +105,69 @@ class PolymarketCLOBClient:
             self._client.set_api_creds(self._client.create_or_derive_api_creds())
         return self._client
 
-    def get_orderbook(self, token_id: str) -> dict:
+    def get_orderbook(self, token_id: str) -> Any:
         client = self._ensure_client()
         return client.get_order_book(token_id)
 
+    @staticmethod
+    def _read_level_value(level: Any, field: str) -> float:
+        if isinstance(level, dict):
+            value = level.get(field, 0)
+        else:
+            value = getattr(level, field, 0)
+        return float(value or 0)
+
+    @staticmethod
+    def _read_book_levels(book: Any, side: str) -> list[Any]:
+        if isinstance(book, dict):
+            levels = book.get(side, [])
+        else:
+            levels = getattr(book, side, [])
+        return list(levels or [])
+
     def get_best_bid(self, token_id: str) -> float:
-        """Fetch orderbook and return the highest resting bid price.
-        This is the price we should use for post-only BUY orders to
-        guarantee maker status.
-        """
+        """Return the highest resting bid for post-only BUY pricing."""
         book = self.get_orderbook(token_id)
-        bids = book.get("bids", [])
+        bids = self._read_book_levels(book, "bids")
         if bids:
-            return float(bids[0].get("price", 0))
+            return self._read_level_value(bids[0], "price")
         return 0.0
 
     def get_best_ask(self, token_id: str) -> float:
         book = self.get_orderbook(token_id)
-        asks = book.get("asks", [])
+        asks = self._read_book_levels(book, "asks")
         if asks:
-            return float(asks[0].get("price", 0))
+            return self._read_level_value(asks[0], "price")
         return 0.0
 
     def get_book_depth(self, token_id: str, levels: int = 3) -> tuple[float, float]:
         """Returns (bid_depth_usd, ask_depth_usd) for top N levels."""
         book = self.get_orderbook(token_id)
         bid_depth = sum(
-            float(b.get("price", 0)) * float(b.get("size", 0))
-            for b in book.get("bids", [])[:levels]
+            self._read_level_value(level, "price") * self._read_level_value(level, "size")
+            for level in self._read_book_levels(book, "bids")[:levels]
         )
         ask_depth = sum(
-            float(a.get("price", 0)) * float(a.get("size", 0))
-            for a in book.get("asks", [])[:levels]
+            self._read_level_value(level, "price") * self._read_level_value(level, "size")
+            for level in self._read_book_levels(book, "asks")[:levels]
         )
         return bid_depth, ask_depth
+
+    def get_order(self, order_id: str) -> Any:
+        client = self._ensure_client()
+        return client.get_order(order_id)
+
+    def get_open_orders(self, order_id: str | None = None) -> list[Any]:
+        client = self._ensure_client()
+        if order_id:
+            from py_clob_client.clob_types import OpenOrderParams
+
+            return client.get_orders(OpenOrderParams(id=order_id))
+        return client.get_orders()
+
+    def cancel_order(self, order_id: str) -> Any:
+        client = self._ensure_client()
+        return client.cancel(order_id)
 
     def place_limit_order(
         self,
