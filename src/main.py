@@ -65,11 +65,18 @@ class Pipeline:
             refresh_interval=strat.get("registry_refresh_sec", 15),
             min_liquidity=strat.get("min_liquidity", 1000),
         )
+        annual_vols = {}
+        for sym in strat.get("symbols", []):
+            vol_key = f"annual_vol_{sym}"
+            if vol_key in strat:
+                annual_vols[sym] = strat[vol_key]
+
         self.comparator = PriceComparator(
             registry=self.registry,
             threshold_pct=strat.get("edge_threshold_pct", 0.003),
             min_secs_remaining=strat.get("min_secs_remaining", 30),
             min_secs_elapsed=strat.get("min_secs_elapsed", 30),
+            annual_vols=annual_vols if annual_vols else None,
         )
         self.guard = SignalGuard(
             cooldown_secs=strat.get("signal_cooldown_sec", 120),
@@ -80,6 +87,7 @@ class Pipeline:
             min_liquidity=strat.get("min_liquidity", 1000),
             min_ev_usd=strat.get("min_ev_usd", 0.10),
             maker_offset_ticks=strat.get("maker_offset_ticks", 1),
+            adverse_selection_haircut=strat.get("adverse_selection_haircut", 0.05),
         )
 
         self.registry.register_window_change_callback(self.guard.on_window_change)

@@ -55,9 +55,8 @@ def build_signals_table(pipeline: Pipeline) -> Table:
     table.add_column("Time", width=8)
     table.add_column("Sym", width=4)
     table.add_column("Dir", width=5)
-    table.add_column("Now", width=11, justify="right")
-    table.add_column("Open", width=11, justify="right")
     table.add_column("Dev", width=7, justify="right")
+    table.add_column("p", width=6, justify="right")
 
     for sig in reversed(pipeline.signals[-12:]):
         ts = datetime.fromtimestamp(sig.timestamp).strftime("%H:%M:%S")
@@ -67,12 +66,11 @@ def build_signals_table(pipeline: Pipeline) -> Table:
             ts,
             sig.asset,
             Text(sig.direction.value, style=f"bold {style}"),
-            f"${sig.current_price:,.2f}",
-            f"${sig.opening_price:,.2f}",
             Text(f"{sig.deviation_pct:+.2%}", style=style),
+            f"{sig.win_prob:.1%}",
         )
     if not pipeline.signals:
-        table.add_row("", "", Text("waiting...", style="dim"), "", "", "")
+        table.add_row("", "", Text("waiting...", style="dim"), "", "")
     return table
 
 
@@ -81,10 +79,10 @@ def build_trades_table(pipeline: Pipeline) -> Table:
     table.add_column("Time", width=8)
     table.add_column("Sym", width=4)
     table.add_column("Side", width=5)
-    table.add_column("Price", width=7, justify="right")
-    table.add_column("Shares", width=7, justify="right")
-    table.add_column("Cost", width=9, justify="right")
-    table.add_column("Dev", width=7, justify="right")
+    table.add_column("q", width=5, justify="right")
+    table.add_column("p", width=5, justify="right")
+    table.add_column("EV", width=6, justify="right")
+    table.add_column("$", width=6, justify="right")
     table.add_column("", width=6)
 
     for t in reversed(pipeline.executor.recent_trades[-12:]):
@@ -92,18 +90,19 @@ def build_trades_table(pipeline: Pipeline) -> Table:
         is_up = t.direction == "UP"
         style = "green" if is_up else "red"
         mode = Text("PAPER", style="yellow") if t.is_paper else Text("LIVE", style="bold red")
+        ev_style = "green" if t.real_ev > 0 else "red"
         table.add_row(
             ts,
             t.signal.asset,
             Text(t.token_side, style=f"bold {style}"),
-            f"${t.price:.3f}",
-            f"{t.shares:.1f}",
-            f"${t.cost_usd:.2f}",
-            Text(f"{t.signal.deviation_pct:+.2%}", style=style),
+            f"{t.price:.2f}",
+            f"{t.win_prob:.0%}",
+            Text(f"${t.real_ev:.2f}", style=ev_style),
+            f"${t.cost_usd:.0f}",
             mode,
         )
     if not pipeline.executor.recent_trades:
-        table.add_row("", "", "", "", "", "", Text("no trades", style="dim"), "")
+        table.add_row("", "", "", "", "", "", Text("--", style="dim"), "")
     return table
 
 
@@ -152,6 +151,7 @@ def build_status_panel(pipeline: Pipeline) -> Panel:
     text.append(f" Guarded:  {pipeline.guard.suppressed_count:>10}\n")
     text.append(f" Passed:   {pipeline.guards_passed:>10}\n")
     text.append(f" SkipLiq:  {pipeline.executor.skipped_low_liq:>10}\n")
+    text.append(f" SkipEdge: {pipeline.executor.skipped_no_edge:>10}\n")
     text.append(f" SkipEV:   {pipeline.executor.skipped_low_ev:>10}\n")
     text.append(f" Pending:  {pipeline.executor.pending_count:>10}\n")
     text.append(f" Filled:   {pipeline.executor.trade_count:>10}\n")
