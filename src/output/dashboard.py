@@ -79,6 +79,7 @@ def build_trades_table(pipeline: Pipeline) -> Table:
     table.add_column("Side", width=5)
     table.add_column("Stat", width=8)
     table.add_column("Fill", width=7, justify="right")
+    table.add_column("f*", width=5, justify="right")
     table.add_column("q", width=5, justify="right")
     table.add_column("p", width=5, justify="right")
     table.add_column("EV", width=6, justify="right")
@@ -90,7 +91,7 @@ def build_trades_table(pipeline: Pipeline) -> Table:
         is_up = t.direction == "UP"
         style = "green" if is_up else "red"
         mode = Text("PAPER", style="yellow") if t.is_paper else Text("LIVE", style="bold red")
-        ev_style = "green" if t.real_ev > 0 else "red"
+        ev_style = "green" if t.submitted_ev > 0 else "red"
         status_style = "green" if t.display_status == "filled" else "yellow" if t.display_status in {"pending", "partial"} else "red"
         table.add_row(
             ts,
@@ -98,14 +99,15 @@ def build_trades_table(pipeline: Pipeline) -> Table:
             Text(t.token_side, style=f"bold {style}"),
             Text(t.display_status, style=status_style),
             f"{t.matched_ratio:.0%}",
+            f"{t.fill_prob:.0%}",
             f"{t.price:.2f}",
             f"{t.win_prob:.0%}",
-            Text(f"${t.real_ev:.2f}", style=ev_style),
+            Text(f"${t.submitted_ev:.2f}", style=ev_style),
             f"${t.matched_cost_usd:.0f}",
             mode,
         )
     if not pipeline.executor.recent_trades:
-        table.add_row("", "", "", "", "", "", "", "", Text("--", style="dim"), "")
+        table.add_row("", "", "", "", "", "", "", "", "", Text("--", style="dim"), "")
     return table
 
 
@@ -182,17 +184,23 @@ def build_status_panel(pipeline: Pipeline) -> Panel:
 def build_ev_panel(pipeline: Pipeline) -> Panel:
     trades = pipeline.executor.recent_trades
     filled = [t for t in trades if t.matched_shares > 0 or t.status.value == "filled"]
-    total_ev = sum(t.realized_ev for t in filled)
+    total_submitted_ev = sum(t.submitted_ev for t in trades)
+    total_matched_ev = sum(t.realized_ev for t in filled)
     total_fee_saved = sum(t.taker_fee_avoided * t.matched_ratio for t in filled)
     matched_weight = sum(t.matched_ratio for t in filled)
     avg_p = sum(t.win_prob * t.matched_ratio for t in filled) / matched_weight if matched_weight > 0 else 0
+    avg_fill_prob = sum(t.fill_prob for t in trades) / len(trades) if trades else 0
 
     text = Text()
-    text.append(f" Filled:    {len(filled)}\n")
-    text.append(f" Sum EV:   ", style="bold")
-    text.append(f"${total_ev:+,.2f}\n", style="green" if total_ev >= 0 else "red")
+    text.append(f" Trades:     {len(trades)}\n")
+    text.append(f" Filled:     {len(filled)}\n")
+    text.append(" Sub EV:    ", style="bold")
+    text.append(f"${total_submitted_ev:+,.2f}\n", style="green" if total_submitted_ev >= 0 else "red")
+    text.append(" Match EV:  ", style="bold")
+    text.append(f"${total_matched_ev:+,.2f}\n", style="green" if total_matched_ev >= 0 else "red")
     text.append(f" Fee saved: ${total_fee_saved:,.2f}\n")
     text.append(f" Avg p:     {avg_p:.1%}\n") if filled else None
+    text.append(f" Avg f*:    {avg_fill_prob:.1%}\n") if trades else None
 
     return Panel(text, title="Expected Value", border_style="green")
 

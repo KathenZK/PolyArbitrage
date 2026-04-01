@@ -14,12 +14,15 @@ strategy:
   # Signal guard: one trade per market window
   signal_cooldown_sec: 120
 
-  # Execution: real EV check = B × (p_adj / q - 1) >= min_ev_usd
+  # Execution: submit only if fill-adjusted EV = fill_prob × B × (p_adj / q - 1) >= min_ev_usd
   bet_size_usd: 15
   min_liquidity: 1000
   min_ev_usd: 0.10                 # minimum real EV in USD to place a trade
   adverse_selection_haircut: 0.05  # subtract 5% from p to account for adverse selection
   maker_offset_ticks: 1
+  fill_rate_prior: 0.35            # prior maker fill ratio before enough live samples exist
+  fill_min_samples: 20             # minimum resolved live orders before using empirical fill stats
+  fill_lookback_hours: 168         # empirical fill window
 
   # Market registry
   registry_refresh_sec: 15

@@ -18,6 +18,8 @@ TRADE_COLUMNS: dict[str, str] = {
     "matched_size": "REAL NOT NULL DEFAULT 0",
     "matched_cost_usd": "REAL NOT NULL DEFAULT 0",
     "win_prob": "REAL NOT NULL DEFAULT 0",
+    "fill_prob": "REAL NOT NULL DEFAULT 0",
+    "filled_ev_usd": "REAL NOT NULL DEFAULT 0",
     "expected_value_usd": "REAL NOT NULL DEFAULT 0",
     "taker_fee_avoided": "REAL NOT NULL DEFAULT 0",
     "expiration_ts": "INTEGER NOT NULL DEFAULT 0",
@@ -107,6 +109,8 @@ def insert_trade(
     status: str,
     order_id: str,
     win_prob: float,
+    fill_prob: float,
+    filled_ev_usd: float,
     expected_value_usd: float,
     taker_fee_avoided: float,
     expiration_ts: int = 0,
@@ -120,9 +124,9 @@ def insert_trade(
             timestamp, updated_at, strategy, event_title, action, side, asset,
             market_id, market_slug, token_id, order_id, price, size,
             matched_size, cost_usd, matched_cost_usd, is_paper, status,
-            win_prob, expected_value_usd, taker_fee_avoided, expiration_ts,
-            last_error, raw_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            win_prob, fill_prob, filled_ev_usd, expected_value_usd,
+            taker_fee_avoided, expiration_ts, last_error, raw_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             now,
@@ -144,6 +148,8 @@ def insert_trade(
             1 if is_paper else 0,
             status,
             win_prob,
+            fill_prob,
+            filled_ev_usd,
             expected_value_usd,
             taker_fee_avoided,
             expiration_ts,
@@ -206,3 +212,40 @@ def get_pending_trades(conn: sqlite3.Connection) -> list[dict[str, Any]]:
         """
     ).fetchall()
     return [dict(row) for row in rows]
+
+
+def get_fill_rate_stats(
+    conn: sqlite3.Connection,
+    *,
+    asset: str | None = None,
+    lookback_hours: float = 168.0,
+) -> dict[str, Any]:
+    since_ts = time.time() - lookback_hours * 3600
+    clauses = [
+        "is_paper=0",
+        "status IN ('filled', 'expired', 'rejected')",
+        "timestamp >= ?",
+    ]
+    params: list[Any] = [since_ts]
+    if asset:
+        clauses.append("UPPER(asset)=UPPER(?)")
+        params.append(asset)
+
+    row = conn.execute(
+        f"""
+        SELECT
+            COUNT(*) AS samples,
+            AVG(CASE WHEN size > 0 THEN matched_size / size ELSE 0 END) AS avg_fill_ratio,
+            AVG(CASE WHEN status='filled' THEN 1.0 ELSE 0.0 END) AS full_fill_rate
+        FROM trades
+        WHERE {' AND '.join(clauses)}
+        """,
+        params,
+    ).fetchone()
+    if not row:
+        return {"samples": 0, "avg_fill_ratio": 0.0, "full_fill_rate": 0.0}
+    return {
+        "samples": int(row["samples"] or 0),
+        "avg_fill_ratio": float(row["avg_fill_ratio"] or 0.0),
+        "full_fill_rate": float(row["full_fill_rate"] or 0.0),
+    }

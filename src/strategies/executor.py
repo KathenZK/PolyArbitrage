@@ -22,7 +22,7 @@ from enum import Enum
 from typing import Any
 
 from src.data.market_registry import CryptoMarket
-from src.output.db import get_pending_trades, insert_trade, update_trade
+from src.output.db import get_fill_rate_stats, get_pending_trades, insert_trade, update_trade
 from src.strategies.momentum import Direction, Signal
 
 logger = logging.getLogger(__name__)
@@ -57,7 +57,9 @@ class TradeResult:
     timestamp: float
     status: OrderStatus = OrderStatus.PENDING
     win_prob: float = 0.0
-    real_ev: float = 0.0
+    fill_prob: float = 0.0
+    filled_ev: float = 0.0
+    submitted_ev: float = 0.0
     taker_fee_avoided: float = 0.0
     expiration_ts: int = 0
     db_id: int | None = None
@@ -74,13 +76,31 @@ class TradeResult:
 
     @property
     def realized_ev(self) -> float:
-        return self.real_ev * self.matched_ratio
+        return self.filled_ev * self.matched_ratio
 
     @property
     def display_status(self) -> str:
         if self.status == OrderStatus.PENDING and self.matched_shares > 0:
             return "partial"
         return self.status.value
+
+
+@dataclass
+class TradePlan:
+    signal: Signal
+    market: CryptoMarket
+    direction: str
+    token_side: str
+    token_id: str
+    price: float
+    shares: float
+    cost_usd: float
+    win_prob: float
+    fill_prob: float
+    filled_ev: float
+    submitted_ev: float
+    taker_fee_avoided: float
+    expiration_ts: int
 
 
 class Executor:
@@ -100,6 +120,9 @@ class Executor:
         maker_offset_ticks: int = 1,
         adverse_selection_haircut: float = 0.05,
         reconcile_interval_secs: float = 2.0,
+        fill_rate_prior: float = 0.35,
+        fill_min_samples: int = 20,
+        fill_lookback_hours: float = 168.0,
     ):
         self._bet_size = bet_size_usd
         self._dry_run = dry_run
@@ -108,6 +131,9 @@ class Executor:
         self._maker_offset = maker_offset_ticks * 0.01
         self._haircut = adverse_selection_haircut
         self._reconcile_interval = reconcile_interval_secs
+        self._fill_rate_prior = fill_rate_prior
+        self._fill_min_samples = fill_min_samples
+        self._fill_lookback_hours = fill_lookback_hours
         self._clob = None
         self._db = None
         self._orders: list[TradeResult] = []
@@ -115,6 +141,7 @@ class Executor:
         self._skipped_low_ev = 0
         self._skipped_no_edge = 0
         self._last_reconcile = 0.0
+        self._fill_stats_cache: dict[str, tuple[float, float]] = {}
 
     @property
     def trade_count(self) -> int:
@@ -191,6 +218,65 @@ class Executor:
         except (TypeError, ValueError):
             return 0.0
 
+    @staticmethod
+    def _clamp(value: float, low: float, high: float) -> float:
+        return max(low, min(high, value))
+
+    def _empirical_fill_ratio(self, asset: str) -> float:
+        cache_key = asset.upper()
+        cached = self._fill_stats_cache.get(cache_key)
+        now = time.time()
+        if cached and now - cached[0] < 60:
+            return cached[1]
+
+        fill_ratio = self._fill_rate_prior
+        if self._db is not None:
+            asset_stats = get_fill_rate_stats(
+                self._db,
+                asset=cache_key,
+                lookback_hours=self._fill_lookback_hours,
+            )
+            if asset_stats["samples"] >= self._fill_min_samples:
+                fill_ratio = asset_stats["avg_fill_ratio"]
+            else:
+                global_stats = get_fill_rate_stats(
+                    self._db,
+                    lookback_hours=self._fill_lookback_hours,
+                )
+                if global_stats["samples"] >= self._fill_min_samples:
+                    fill_ratio = global_stats["avg_fill_ratio"]
+
+        fill_ratio = self._clamp(fill_ratio, 0.05, 0.95)
+        self._fill_stats_cache[cache_key] = (now, fill_ratio)
+        return fill_ratio
+
+    def _estimate_fill_probability(
+        self,
+        *,
+        asset: str,
+        market: CryptoMarket,
+        quote_price: float,
+    ) -> float:
+        prior = self._empirical_fill_ratio(asset)
+
+        best_bid = market.best_bid if market.best_bid > 0 else quote_price
+        best_ask = market.best_ask if market.best_ask > 0 else max(quote_price + 0.01, best_bid + 0.01)
+        spread = max(0.01, best_ask - best_bid)
+        ticks_behind_top = max(0.0, (best_bid - quote_price) / 0.01)
+
+        queue_factor = 1.0 / (1.0 + ticks_behind_top)
+        spread_factor = self._clamp(spread / 0.03, 0.5, 1.25)
+        time_factor = self._clamp(market.secs_remaining / 300.0, 0.25, 1.0)
+        liquidity_factor = self._clamp(market.liquidity / max(self._min_liquidity, 1.0), 0.5, 1.5)
+
+        fill_prob = prior
+        fill_prob *= 0.7 + 0.3 * queue_factor
+        fill_prob *= 0.85 + 0.15 * min(1.0, spread_factor)
+        fill_prob *= 0.6 + 0.4 * time_factor
+        fill_prob *= 0.75 + 0.25 * min(1.0, liquidity_factor)
+
+        return self._clamp(fill_prob, 0.02, 0.98)
+
     def _normalize_status(self, raw_status: str, expiration_ts: int = 0) -> OrderStatus | None:
         if raw_status in self._FILLED_STATUSES:
             return OrderStatus.FILLED
@@ -263,7 +349,9 @@ class Executor:
                 status=trade.status.value,
                 order_id=trade.order_id,
                 win_prob=trade.win_prob,
-                expected_value_usd=trade.real_ev,
+                fill_prob=trade.fill_prob,
+                filled_ev_usd=trade.filled_ev,
+                expected_value_usd=trade.submitted_ev,
                 taker_fee_avoided=trade.taker_fee_avoided,
                 expiration_ts=trade.expiration_ts,
                 last_error=trade.last_error,
@@ -314,7 +402,9 @@ class Executor:
                 timestamp=float(row.get("timestamp", 0) or 0),
                 status=status,
                 win_prob=float(row.get("win_prob", 0) or 0),
-                real_ev=float(row.get("expected_value_usd", 0) or 0),
+                fill_prob=float(row.get("fill_prob", 0) or 0),
+                filled_ev=float(row.get("filled_ev_usd", row.get("expected_value_usd", 0)) or 0),
+                submitted_ev=float(row.get("expected_value_usd", 0) or 0),
                 taker_fee_avoided=float(row.get("taker_fee_avoided", 0) or 0),
                 expiration_ts=int(row.get("expiration_ts", 0) or 0),
                 db_id=int(row.get("id", 0) or 0),
@@ -402,9 +492,8 @@ class Executor:
 
         return updated
 
-    async def execute(self, signal: Signal) -> TradeResult | None:
+    def evaluate_signal(self, signal: Signal) -> TradePlan | None:
         market = signal.market
-
         if market.liquidity < self._min_liquidity:
             self._skipped_low_liq += 1
             return None
@@ -453,39 +542,71 @@ class Executor:
         if shares < market.order_min_size:
             return None
 
-        real_ev = self._bet_size * (p / q - 1)
+        filled_ev = self._bet_size * (p / q - 1)
+        fill_prob = self._estimate_fill_probability(
+            asset=signal.asset,
+            market=market,
+            quote_price=q,
+        )
+        submitted_ev = filled_ev * fill_prob
         taker_fee = calc_taker_fee(shares, q, market.fee_rate)
-        if real_ev < self._min_ev:
+
+        if submitted_ev < self._min_ev:
             self._skipped_low_ev += 1
             logger.debug(
                 f"Skip {signal.asset} {signal.direction.value}: "
-                f"EV ${real_ev:.2f} < ${self._min_ev:.2f} (p={p:.3f}, q={q:.2f})"
+                f"submitted_EV ${submitted_ev:.2f} < ${self._min_ev:.2f} "
+                f"(filled_EV=${filled_ev:.2f}, fill={fill_prob:.1%}, p={p:.3f}, q={q:.2f})"
             )
             return None
 
         expiration = int(market.end_time) + 60 if market.end_time > 0 else 0
+        return TradePlan(
+            signal=signal,
+            market=market,
+            direction=signal.direction.value,
+            token_side=token_side,
+            token_id=token_id,
+            price=q,
+            shares=shares,
+            cost_usd=self._bet_size,
+            win_prob=p,
+            fill_prob=fill_prob,
+            filled_ev=filled_ev,
+            submitted_ev=submitted_ev,
+            taker_fee_avoided=taker_fee,
+            expiration_ts=expiration,
+        )
+
+    async def execute(self, signal: Signal) -> TradeResult | None:
+        plan = self.evaluate_signal(signal)
+        if plan is None:
+            return None
+
+        market = plan.market
         raw_response: Any = {}
         last_error = ""
 
         if self._dry_run:
             order_id = f"paper-{len(self._orders) + 1}"
             status = OrderStatus.FILLED
-            matched_shares = shares
-            matched_cost_usd = round(self._bet_size, 6)
+            matched_shares = plan.shares
+            matched_cost_usd = round(plan.cost_usd, 6)
             logger.info(
-                f"[PAPER] {signal.asset} {signal.direction.value} -> buy {token_side} "
-                f"@ ${q:.2f} x {shares:.1f} = ${self._bet_size:.2f} | "
-                f"p={p_raw:.1%} p_adj={p:.1%} EV=${real_ev:.2f} fee_saved=${taker_fee:.2f}"
+                f"[PAPER] {signal.asset} {signal.direction.value} -> buy {plan.token_side} "
+                f"@ ${plan.price:.2f} x {plan.shares:.1f} = ${plan.cost_usd:.2f} | "
+                f"p_adj={plan.win_prob:.1%} fill={plan.fill_prob:.1%} "
+                f"fEV=${plan.filled_ev:.2f} sEV=${plan.submitted_ev:.2f}"
             )
         else:
             try:
                 clob = self._ensure_clob()
                 raw_response = clob.place_limit_order(
-                    token_id=token_id,
+                    token_id=plan.token_id,
                     side="BUY",
-                    price=q,
-                    size=round(shares, 2),
-                    expiration=expiration,
+                    price=plan.price,
+                    size=round(plan.shares, 2),
+                    expiration=plan.expiration_ts,
                     post_only=True,
                 )
                 order_id = self._extract_order_id(raw_response)
@@ -496,14 +617,16 @@ class Executor:
 
                 status, matched_shares, matched_cost_usd, raw_status, _ = self._parse_order_state(
                     raw_response,
-                    target_shares=shares,
-                    price=q,
-                    expiration_ts=expiration,
+                    target_shares=plan.shares,
+                    price=plan.price,
+                    expiration_ts=plan.expiration_ts,
                 )
                 status = status or OrderStatus.PENDING
                 logger.info(
-                    f"[LIVE] {signal.asset} {signal.direction.value} -> buy {token_side} "
-                    f"@ ${q:.2f} x {shares:.1f} | p={p:.1%} EV=${real_ev:.2f} "
+                    f"[LIVE] {signal.asset} {signal.direction.value} -> buy {plan.token_side} "
+                    f"@ ${plan.price:.2f} x {plan.shares:.1f} | "
+                    f"p={plan.win_prob:.1%} fill={plan.fill_prob:.1%} "
+                    f"fEV=${plan.filled_ev:.2f} sEV=${plan.submitted_ev:.2f} "
                     f"order={order_id} status={raw_status or status.value}"
                 )
             except Exception as exc:
@@ -514,22 +637,24 @@ class Executor:
             signal=signal,
             market=market,
             asset=signal.asset,
-            direction=signal.direction.value,
-            token_side=token_side,
-            token_id=token_id,
-            price=q,
-            shares=shares,
+            direction=plan.direction,
+            token_side=plan.token_side,
+            token_id=plan.token_id,
+            price=plan.price,
+            shares=plan.shares,
             matched_shares=matched_shares,
-            cost_usd=self._bet_size,
+            cost_usd=plan.cost_usd,
             matched_cost_usd=matched_cost_usd,
             order_id=order_id,
             is_paper=self._dry_run,
             timestamp=time.time(),
             status=status,
-            win_prob=p,
-            real_ev=real_ev,
-            taker_fee_avoided=taker_fee,
-            expiration_ts=expiration,
+            win_prob=plan.win_prob,
+            fill_prob=plan.fill_prob,
+            filled_ev=plan.filled_ev,
+            submitted_ev=plan.submitted_ev,
+            taker_fee_avoided=plan.taker_fee_avoided,
+            expiration_ts=plan.expiration_ts,
             last_error=last_error,
             raw_status=status.value if self._dry_run else self._extract_status(raw_response),
         )

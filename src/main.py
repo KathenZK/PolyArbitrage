@@ -88,6 +88,9 @@ class Pipeline:
             min_ev_usd=strat.get("min_ev_usd", 0.10),
             maker_offset_ticks=strat.get("maker_offset_ticks", 1),
             adverse_selection_haircut=strat.get("adverse_selection_haircut", 0.05),
+            fill_rate_prior=strat.get("fill_rate_prior", 0.35),
+            fill_min_samples=strat.get("fill_min_samples", 20),
+            fill_lookback_hours=strat.get("fill_lookback_hours", 168),
         )
 
         self.registry.register_window_change_callback(self.guard.on_window_change)
