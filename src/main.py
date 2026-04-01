@@ -34,7 +34,6 @@ from src.data.market_registry import MarketRegistry, current_window_start
 from src.data.polymarket_client import PolymarketGammaClient
 from src.output.alerts import DingTalkAlert
 from src.output.dashboard import build_dashboard
-from src.output.db import get_connection, init_db
 from src.strategies.executor import Executor
 from src.strategies.momentum import PriceComparator, Signal
 from src.strategies.signal_guard import SignalGuard
@@ -170,10 +169,6 @@ class Pipeline:
             return True
 
     async def run(self):
-        conn = get_connection()
-        init_db(conn)
-        conn.close()
-
         dry_run = self.config.get("risk", {}).get("dry_run", True)
         symbols = self.config.get("strategy", {}).get("symbols", ["btcusdt"])
         self.start_time = time.time()
@@ -214,10 +209,6 @@ class Pipeline:
             stream_task.cancel()
 
     async def run_headless(self):
-        conn = get_connection()
-        init_db(conn)
-        conn.close()
-
         self.start_time = time.time()
         logger.info("Pipeline started (headless)")
 

@@ -11,8 +11,6 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from src.output.db import get_connection, get_trade_summary
-
 if TYPE_CHECKING:
     from src.main import Pipeline
 
@@ -176,26 +174,21 @@ def build_status_panel(pipeline: Pipeline) -> Panel:
     return Panel(text, title="Status", border_style="blue")
 
 
-def build_pnl_panel() -> Panel:
-    try:
-        conn = get_connection()
-        summary = get_trade_summary(conn)
-        conn.close()
-    except Exception:
-        return Panel(" DB not ready", title="P&L", border_style="red")
-
-    total = summary.get("total_trades", 0)
-    wins = summary.get("wins", 0)
-    pnl = summary.get("total_pnl", 0.0) or 0.0
-    win_rate = (wins / total * 100) if total > 0 else 0
+def build_ev_panel(pipeline: Pipeline) -> Panel:
+    trades = pipeline.executor.recent_trades
+    filled = [t for t in trades if t.status.value == "filled"]
+    total_ev = sum(t.real_ev for t in filled)
+    total_fee_saved = sum(t.taker_fee_avoided for t in filled)
+    avg_p = sum(t.win_prob for t in filled) / len(filled) if filled else 0
 
     text = Text()
-    text.append(f" P&L:     ", style="bold")
-    text.append(f"${pnl:+,.2f}\n", style="green" if pnl >= 0 else "red")
-    text.append(f" Resolved: {total}  Wins: {wins}\n")
-    text.append(f" Win Rate: {win_rate:.1f}%\n")
+    text.append(f" Filled:    {len(filled)}\n")
+    text.append(f" Sum EV:   ", style="bold")
+    text.append(f"${total_ev:+,.2f}\n", style="green" if total_ev >= 0 else "red")
+    text.append(f" Fee saved: ${total_fee_saved:,.2f}\n")
+    text.append(f" Avg p:     {avg_p:.1%}\n") if filled else None
 
-    return Panel(text, title="P&L (Resolved)", border_style="green")
+    return Panel(text, title="Expected Value", border_style="green")
 
 
 def build_dashboard(pipeline: Pipeline) -> Layout:
@@ -230,7 +223,7 @@ def build_dashboard(pipeline: Pipeline) -> Layout:
 
     layout["bottom"].split_row(
         Layout(build_status_panel(pipeline), ratio=1),
-        Layout(build_pnl_panel(), ratio=1),
+        Layout(build_ev_panel(pipeline), ratio=1),
     )
 
     return layout

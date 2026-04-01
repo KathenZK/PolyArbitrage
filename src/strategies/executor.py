@@ -27,7 +27,6 @@ from dataclasses import dataclass
 from enum import Enum
 
 from src.data.market_registry import CryptoMarket
-from src.output.db import get_connection, insert_trade
 from src.strategies.momentum import Direction, Signal
 
 logger = logging.getLogger(__name__)
@@ -256,24 +255,5 @@ class Executor:
             taker_fee_avoided=taker_fee,
         )
         self._orders.append(trade)
-
-        try:
-            conn = get_connection()
-            insert_trade(
-                conn,
-                strategy="LatencyArb",
-                event_title=market.question,
-                action=f"BUY_{token_side.upper()}",
-                side="BUY",
-                market_id=market.market_id,
-                token_id=token_id,
-                price=q,
-                size=shares,
-                cost_usd=self._bet_size,
-                is_paper=self._dry_run,
-            )
-            conn.close()
-        except Exception as e:
-            logger.debug(f"DB insert error: {e}")
 
         return trade
