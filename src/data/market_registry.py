@@ -327,7 +327,12 @@ class MarketRegistry:
         )
 
     async def run(self):
-        """Refresh loop aligned to window boundaries."""
+        """Refresh loop aligned to window boundaries.
+
+        Near window end (< 20s left): pre-fetch next window's markets,
+        then sleep until boundary, then immediately refresh to pick up
+        the new window and record opening prices from the tick buffer.
+        """
         self._running = True
         while self._running:
             now = time.time()
@@ -338,9 +343,10 @@ class MarketRegistry:
             await self.refresh()
 
             if secs_to_next <= 20:
-                await asyncio.sleep(max(0.5, secs_to_next - 2))
+                await self._pre_fetch_next_window()
+                await asyncio.sleep(max(0.5, secs_to_next - 1))
                 await self.refresh()
-                await asyncio.sleep(3)
+                await asyncio.sleep(2)
             else:
                 sleep_time = min(self._refresh_interval, secs_to_next - 15)
                 await asyncio.sleep(max(1, sleep_time))

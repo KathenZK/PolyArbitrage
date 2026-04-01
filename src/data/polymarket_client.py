@@ -109,9 +109,36 @@ class PolymarketCLOBClient:
         client = self._ensure_client()
         return client.get_order_book(token_id)
 
-    def get_price(self, token_id: str, side: str = "buy") -> float:
-        client = self._ensure_client()
-        return float(client.get_price(token_id, side))
+    def get_best_bid(self, token_id: str) -> float:
+        """Fetch orderbook and return the highest resting bid price.
+        This is the price we should use for post-only BUY orders to
+        guarantee maker status.
+        """
+        book = self.get_orderbook(token_id)
+        bids = book.get("bids", [])
+        if bids:
+            return float(bids[0].get("price", 0))
+        return 0.0
+
+    def get_best_ask(self, token_id: str) -> float:
+        book = self.get_orderbook(token_id)
+        asks = book.get("asks", [])
+        if asks:
+            return float(asks[0].get("price", 0))
+        return 0.0
+
+    def get_book_depth(self, token_id: str, levels: int = 3) -> tuple[float, float]:
+        """Returns (bid_depth_usd, ask_depth_usd) for top N levels."""
+        book = self.get_orderbook(token_id)
+        bid_depth = sum(
+            float(b.get("price", 0)) * float(b.get("size", 0))
+            for b in book.get("bids", [])[:levels]
+        )
+        ask_depth = sum(
+            float(a.get("price", 0)) * float(a.get("size", 0))
+            for a in book.get("asks", [])[:levels]
+        )
+        return bid_depth, ask_depth
 
     def place_limit_order(
         self,

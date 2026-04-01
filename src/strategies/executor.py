@@ -149,17 +149,19 @@ class Executor:
         if token_price <= 0.01 or token_price >= 0.99:
             return None
 
-        # --- Maker price: fetch live or use Gamma ---
-        live_bid = 0.0
+        # --- Maker price: fetch real best bid from CLOB orderbook ---
+        # We explicitly parse the orderbook to get the highest resting bid.
+        # This avoids ambiguity in get_price() which may return ask-side.
+        clob_bid = 0.0
         if not self._dry_run:
             try:
                 clob = self._ensure_clob()
-                live_bid = clob.get_price(token_id, "buy")
+                clob_bid = clob.get_best_bid(token_id)
             except Exception as e:
-                logger.debug(f"CLOB price fetch failed, using Gamma: {e}")
+                logger.debug(f"CLOB orderbook fetch failed, using Gamma: {e}")
 
-        if live_bid > 0:
-            q = round(live_bid, 2)
+        if clob_bid > 0:
+            q = clob_bid
         elif signal.direction == Direction.UP:
             q = market.best_bid if market.best_bid > 0 else token_price - self._maker_offset
         else:
