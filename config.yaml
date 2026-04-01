@@ -1,38 +1,23 @@
-strategies:
-  cross_platform:
-    enabled: true
-    min_gross_edge: 0.0275
-    kalshi_fee: 0.0175
-    polymarket_fee: 0.0
-    bridge_cost: 0.005
-    poll_interval_sec: 10
-    kalshi_demo: true  # true = use demo API (no real money), false = production
+strategy:
+  symbols: ["btcusdt", "ethusdt", "solusdt"]
 
-  negrisk:
-    enabled: true
-    min_deviation: 0.03
-    min_daily_volume: 50000
-    max_settlement_days: 30
-    scan_interval_sec: 30
+  # Momentum detector: 0.3% move in 60s window triggers signal
+  momentum_threshold_pct: 0.003
+  momentum_window_sec: 60
 
-  sports_ev:
-    enabled: true
-    min_edge: 0.04
-    sports: ["nba", "ncaa"]
-    scan_interval_sec: 30
+  # Signal guard: suppress same-direction duplicates within cooldown
+  signal_cooldown_sec: 120
+
+  # Execution
+  bet_size_usd: 15              # USD per trade
+  min_secs_remaining: 30        # skip markets expiring within this window
+
+  # Market registry
+  registry_refresh_sec: 30      # how often to rescan Polymarket for new markets
 
 risk:
-  daily_loss_limit_pct: 0.10
-  max_position_pct: 0.02
-  cooldown_sec: 60
-  dry_run: true
+  dry_run: true                 # true = paper trading, false = real money
 
 alerts:
-  telegram_enabled: false
-  telegram_bot_token: ""
-  telegram_chat_id: ""
-
-capital:
-  total_usd: 10000
-  polymarket_allocation: 0.6
-  kalshi_allocation: 0.4
+  dingtalk_webhook: "https://oapi.dingtalk.com/robot/send?access_token=274c97076883209c4651bfa37c1312e23b3d58329fbc5a8e90307be7662bbe1b"
+  dingtalk_keyword: "PolyGod"   # must match the custom keyword in DingTalk robot settings

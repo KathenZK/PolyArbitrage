@@ -1,4 +1,11 @@
-"""PolyArbitrage — main entry point and orchestrator."""
+"""PolyArbitrage — Binance-Polymarket latency arbitrage pipeline.
+
+Architecture (4 stages):
+  Binance aggTrade WS → MomentumDetector → SignalGuard → CLOB Executor
+
+The pipeline exploits the 30-90 second price lag between Binance spot moves
+and Polymarket 15-minute crypto market repricing.
+"""
 
 from __future__ import annotations
 
@@ -18,12 +25,15 @@ load_dotenv()
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.data.market_store import MarketStore
+from src.data.binance_stream import BinanceStream, Tick
+from src.data.market_registry import MarketRegistry
 from src.data.polymarket_client import PolymarketGammaClient
-from src.output.alerts import AlertSystem
-from src.output.dashboard import build_layout
+from src.output.alerts import DingTalkAlert
+from src.output.dashboard import build_dashboard
 from src.output.db import get_connection, init_db
-from src.strategies.base import Opportunity
+from src.strategies.executor import Executor
+from src.strategies.momentum import MomentumDetector, Signal
+from src.strategies.signal_guard import SignalGuard
 
 console = Console()
 logger = logging.getLogger("polyarbitrage")
@@ -35,161 +45,143 @@ def load_config() -> dict:
         return yaml.safe_load(f)
 
 
-class Orchestrator:
-    """Runs all enabled strategies on a timer loop and updates the dashboard."""
+class Pipeline:
+    """Wires Binance stream -> Momentum -> Guard -> Executor into a single async loop."""
 
     def __init__(self, config: dict):
         self.config = config
-        self.store = MarketStore()
+        strat = config.get("strategy", {})
+
         self.gamma = PolymarketGammaClient()
-        self.alerts = AlertSystem(
-            telegram_token=config.get("alerts", {}).get("telegram_bot_token", "")
-                           or os.getenv("TELEGRAM_BOT_TOKEN", ""),
-            telegram_chat_id=config.get("alerts", {}).get("telegram_chat_id", "")
-                             or os.getenv("TELEGRAM_CHAT_ID", ""),
+        self.registry = MarketRegistry(
+            self.gamma,
+            refresh_interval=strat.get("registry_refresh_sec", 30),
         )
-        self.opportunities: list[Opportunity] = []
-        self.scan_count = 0
-        self.last_scan = 0.0
-        self._strategies = []
+        self.detector = MomentumDetector(
+            threshold_pct=strat.get("momentum_threshold_pct", 0.003),
+            window_secs=strat.get("momentum_window_sec", 60),
+        )
+        self.guard = SignalGuard(
+            cooldown_secs=strat.get("signal_cooldown_sec", 120),
+        )
+        self.executor = Executor(
+            registry=self.registry,
+            bet_size_usd=strat.get("bet_size_usd", 15),
+            dry_run=config.get("risk", {}).get("dry_run", True),
+            min_secs_remaining=strat.get("min_secs_remaining", 30),
+        )
 
-    def _init_strategies(self):
-        cfg = self.config.get("strategies", {})
+        alert_cfg = config.get("alerts", {})
+        self.alerts = DingTalkAlert(
+            webhook_url=alert_cfg.get("dingtalk_webhook", "") or os.getenv("DINGTALK_WEBHOOK", ""),
+            keyword=alert_cfg.get("dingtalk_keyword", "PolyGod"),
+        )
 
-        if cfg.get("negrisk", {}).get("enabled", True):
-            from src.strategies.negrisk import NegRiskStrategy
-            nr_cfg = cfg["negrisk"]
-            self._strategies.append(NegRiskStrategy(
-                gamma_client=self.gamma,
-                store=self.store,
-                min_deviation=nr_cfg.get("min_deviation", 0.03),
-                min_daily_volume=nr_cfg.get("min_daily_volume", 50_000),
-                max_settlement_days=nr_cfg.get("max_settlement_days", 30),
-            ))
+        symbols = strat.get("symbols", ["btcusdt", "ethusdt", "solusdt"])
+        self.stream = BinanceStream(symbols=symbols, on_tick=self._on_tick)
 
-        if cfg.get("cross_platform", {}).get("enabled", True):
-            try:
-                from src.strategies.cross_platform import CrossPlatformStrategy
-                cp_cfg = cfg["cross_platform"]
-                kalshi_key_id = os.getenv("KALSHI_API_KEY_ID", "")
-                kalshi_pk_path = os.getenv("KALSHI_PRIVATE_KEY_PATH", "")
-                self._strategies.append(CrossPlatformStrategy(
-                    gamma_client=self.gamma,
-                    store=self.store,
-                    kalshi_key_id=kalshi_key_id,
-                    kalshi_pk_path=kalshi_pk_path,
-                    min_gross_edge=cp_cfg.get("min_gross_edge", 0.0275),
-                    kalshi_fee=cp_cfg.get("kalshi_fee", 0.0175),
-                    poly_fee=cp_cfg.get("polymarket_fee", 0.0),
-                    bridge_cost=cp_cfg.get("bridge_cost", 0.005),
-                    kalshi_demo=cp_cfg.get("kalshi_demo", True),
-                ))
-            except Exception as e:
-                logger.warning(f"Cross-platform strategy disabled: {e}")
+        self.signals: list[Signal] = []
+        self.ticks_count = 0
+        self.signals_count = 0
+        self.guards_passed = 0
+        self.last_prices: dict[str, float] = {}
+        self.start_time = 0.0
 
-        if cfg.get("sports_ev", {}).get("enabled", True):
-            try:
-                from src.strategies.sports_ev import SportsEVStrategy
-                ev_cfg = cfg["sports_ev"]
-                self._strategies.append(SportsEVStrategy(
-                    gamma_client=self.gamma,
-                    store=self.store,
-                    min_edge=ev_cfg.get("min_edge", 0.04),
-                    sports=ev_cfg.get("sports", ["nba"]),
-                ))
-            except Exception as e:
-                logger.warning(f"Sports EV strategy disabled: {e}")
+    async def _on_tick(self, tick: Tick):
+        self.ticks_count += 1
+        self.last_prices[tick.symbol] = tick.price
 
-    async def run_scan(self):
-        all_opps: list[Opportunity] = []
-        for strategy in self._strategies:
-            try:
-                opps = await strategy.scan()
-                all_opps.extend(opps)
-                for opp in opps:
-                    if opp.is_actionable:
-                        await self.alerts.send(opp)
-            except Exception as e:
-                logger.error(f"Strategy {strategy.name} scan error: {e}")
+        signal = self.detector.update(tick.symbol, tick.timestamp, tick.price)
+        if signal is None:
+            return
 
-        all_opps.sort(key=lambda o: o.edge_pct, reverse=True)
-        self.opportunities = all_opps
-        self.scan_count += 1
-        self.last_scan = time.time()
+        self.signals_count += 1
+        self.signals.append(signal)
+        if len(self.signals) > 200:
+            self.signals = self.signals[-200:]
 
-    async def run_dashboard(self):
-        """Main loop: scan on interval, update dashboard live."""
-        self._init_strategies()
+        if not self.guard.should_trade(signal):
+            return
 
+        self.guards_passed += 1
+        asyncio.create_task(self._execute(signal))
+
+    async def _execute(self, signal: Signal):
+        try:
+            result = await self.executor.execute(signal)
+            if result:
+                sym = signal.symbol.replace("usdt", "").upper()
+                logger.info(
+                    f"Trade #{result.order_id}: {result.direction} {sym} ${result.cost_usd:.2f}"
+                )
+                await self.alerts.send_trade(
+                    symbol=sym,
+                    direction=result.direction,
+                    price=result.price,
+                    shares=result.shares,
+                    cost=result.cost_usd,
+                    momentum=signal.momentum_pct,
+                    market_question=result.market.question,
+                    is_paper=result.is_paper,
+                    order_id=result.order_id,
+                )
+        except Exception as e:
+            logger.error(f"Execution error: {e}")
+
+    async def run(self):
         conn = get_connection()
         init_db(conn)
         conn.close()
 
-        console.print("[bold blue]PolyArbitrage Scanner starting...[/bold blue]")
-        console.print(f"  Strategies: {[s.name for s in self._strategies]}")
-        console.print(f"  Mode: {'PAPER' if self.config.get('risk', {}).get('dry_run', True) else 'LIVE'}")
+        dry_run = self.config.get("risk", {}).get("dry_run", True)
+        symbols = self.config.get("strategy", {}).get("symbols", ["btcusdt"])
+        self.start_time = time.time()
+
+        console.print("[bold blue]PolyArbitrage — Latency Arb Pipeline[/bold blue]")
+        console.print(f"  Mode:    {'PAPER' if dry_run else '[bold red]LIVE[/bold red]'}")
+        console.print(f"  Symbols: {[s.replace('usdt','').upper() for s in symbols]}")
+        console.print(f"  Bet:     ${self.config.get('strategy', {}).get('bet_size_usd', 15)}/trade")
         console.print()
 
-        with Live(
-            build_layout(self.opportunities, self.store, self.scan_count, self.last_scan),
-            console=console,
-            refresh_per_second=1,
-            screen=True,
-        ) as live:
-            while True:
-                try:
-                    await self.run_scan()
-                except Exception as e:
-                    logger.error(f"Scan cycle error: {e}")
+        registry_task = asyncio.create_task(self.registry.run())
+        await self.registry.refresh()
 
-                live.update(
-                    build_layout(self.opportunities, self.store, self.scan_count, self.last_scan)
-                )
+        stream_task = asyncio.create_task(self.stream.run())
 
-                interval = min(
-                    self.config.get("strategies", {}).get("negrisk", {}).get("scan_interval_sec", 30),
-                    self.config.get("strategies", {}).get("cross_platform", {}).get("poll_interval_sec", 10),
-                    self.config.get("strategies", {}).get("sports_ev", {}).get("scan_interval_sec", 30),
-                )
-                await asyncio.sleep(interval)
+        await self.alerts.send_startup(
+            mode="PAPER" if dry_run else "LIVE",
+            symbols=[s.replace("usdt", "").upper() for s in symbols],
+        )
 
-    async def run_once(self):
-        """Single scan cycle — prints results as tables and exits."""
-        self._init_strategies()
+        try:
+            with Live(console=console, refresh_per_second=2, screen=True) as live:
+                while True:
+                    live.update(build_dashboard(self))
+                    await asyncio.sleep(0.5)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            registry_task.cancel()
+            stream_task.cancel()
 
+    async def run_headless(self):
+        """Run without dashboard — useful for background/server deployment."""
         conn = get_connection()
         init_db(conn)
         conn.close()
 
-        console.print("[bold blue]PolyArbitrage — Single Scan[/bold blue]")
-        console.print(f"  Strategies: {[s.name for s in self._strategies]}")
-        console.print()
+        self.start_time = time.time()
+        logger.info("Pipeline started (headless mode)")
 
-        for strategy in self._strategies:
-            console.print(f"[cyan]Scanning: {strategy.name}...[/cyan]")
-            try:
-                opps = await strategy.scan()
-                self.opportunities.extend(opps)
-                console.print(f"  Found [bold]{len(opps)}[/bold] opportunities\n")
-            except Exception as e:
-                console.print(f"  [red]Error: {e}[/red]\n")
+        registry_task = asyncio.create_task(self.registry.run())
+        await self.registry.refresh()
 
-        self.opportunities.sort(key=lambda o: o.edge_pct, reverse=True)
-        self.scan_count = 1
-        self.last_scan = time.time()
-
-        from src.output.dashboard import build_opportunities_table, build_negrisk_detail_table
-        console.print(build_opportunities_table(self.opportunities))
-        console.print()
-        console.print(build_negrisk_detail_table(self.store))
+        await self.stream.run()
 
     async def shutdown(self):
+        self.stream.stop()
+        self.registry.stop()
         await self.gamma.close()
-        for strategy in self._strategies:
-            for attr in ("_kalshi", "_espn"):
-                client = getattr(strategy, attr, None)
-                if client and hasattr(client, "close"):
-                    await client.close()
 
 
 def main():
@@ -200,21 +192,18 @@ def main():
     )
 
     config = load_config()
-    orchestrator = Orchestrator(config)
+    pipeline = Pipeline(config)
 
-    mode = sys.argv[1] if len(sys.argv) > 1 else "scan"
+    mode = sys.argv[1] if len(sys.argv) > 1 else "live"
 
     try:
-        if mode == "live":
-            asyncio.run(orchestrator.run_dashboard())
+        if mode == "headless":
+            asyncio.run(pipeline.run_headless())
         else:
-            async def _scan_and_close():
-                await orchestrator.run_once()
-                await orchestrator.shutdown()
-            asyncio.run(_scan_and_close())
+            asyncio.run(pipeline.run())
     except KeyboardInterrupt:
         console.print("\n[yellow]Shutting down...[/yellow]")
-        asyncio.run(orchestrator.shutdown())
+        asyncio.run(pipeline.shutdown())
 
 
 if __name__ == "__main__":

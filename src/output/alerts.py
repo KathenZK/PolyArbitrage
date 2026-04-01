@@ -1,72 +1,103 @@
-"""Alert system: terminal output and Telegram push notifications."""
+"""Alert system: DingTalk (钉钉) webhook notifications.
+
+Security: DingTalk custom robot requires every message to contain the
+configured keyword. We prepend "PolyGod" to all messages automatically.
+"""
 
 from __future__ import annotations
 
 import logging
-from typing import Any
+import os
+from datetime import datetime
 
 import aiohttp
-from rich.console import Console
-
-from src.strategies.base import Opportunity
 
 logger = logging.getLogger(__name__)
-console = Console()
 
 
-class AlertSystem:
-    def __init__(self, telegram_token: str = "", telegram_chat_id: str = ""):
-        self._tg_token = telegram_token
-        self._tg_chat_id = telegram_chat_id
-        self._sent: set[str] = set()
+class DingTalkAlert:
+    def __init__(self, webhook_url: str = "", keyword: str = "PolyGod"):
+        self._url = webhook_url or os.getenv("DINGTALK_WEBHOOK", "")
+        self._keyword = keyword
 
-    async def send(self, opp: Opportunity, min_edge: float = 3.0):
-        if opp.edge_pct < min_edge:
+    @property
+    def enabled(self) -> bool:
+        return bool(self._url)
+
+    async def send_text(self, content: str):
+        if not self._url:
             return
+        body = {
+            "msgtype": "text",
+            "text": {"content": f"{self._keyword} {content}"},
+        }
+        await self._post(body)
 
-        key = f"{opp.strategy}:{opp.event_title}:{opp.action}"
-        if key in self._sent:
+    async def send_markdown(self, title: str, text: str):
+        if not self._url:
             return
-        self._sent.add(key)
+        if self._keyword not in text:
+            text = f"**{self._keyword}**\n\n{text}"
+        body = {
+            "msgtype": "markdown",
+            "markdown": {"title": title, "text": text},
+        }
+        await self._post(body)
 
-        self._print_terminal(opp)
-
-        if self._tg_token and self._tg_chat_id:
-            await self._send_telegram(opp)
-
-    def _print_terminal(self, opp: Opportunity):
-        console.print(f"\n[bold green]>>> OPPORTUNITY DETECTED <<<[/bold green]")
-        console.print(f"  Strategy:  {opp.strategy}")
-        console.print(f"  Event:     {opp.event_title}")
-        console.print(f"  Action:    {opp.action.value}")
-        console.print(f"  Edge:      {opp.edge_pct:.2f}%")
-        if opp.settlement_date:
-            console.print(f"  Settles:   {opp.settlement_date[:10]}")
-        details = opp.details
-        if "yes_sum" in details:
-            console.print(f"  YES Sum:   ${details['yes_sum']}")
-        if "profit_pct" in details:
-            console.print(f"  Profit:    {details['profit_pct']:.2f}%")
-
-    async def _send_telegram(self, opp: Opportunity):
+    async def send_trade(
+        self,
+        symbol: str,
+        direction: str,
+        price: float,
+        shares: float,
+        cost: float,
+        momentum: float,
+        market_question: str,
+        is_paper: bool,
+        order_id: str,
+    ):
+        mode = "PAPER" if is_paper else "LIVE"
+        ts = datetime.now().strftime("%H:%M:%S")
         text = (
-            f"*{opp.strategy}*\n"
-            f"Event: {opp.event_title}\n"
-            f"Action: `{opp.action.value}`\n"
-            f"Edge: {opp.edge_pct:.2f}%\n"
+            f"**{self._keyword} Trade #{order_id}**\n\n"
+            f"> **{direction}** {symbol} @ ${price:.3f}\n\n"
+            f"- Shares: {shares:.1f}\n"
+            f"- Cost: ${cost:.2f}\n"
+            f"- Momentum: {momentum:+.2%}\n"
+            f"- Mode: **{mode}**\n"
+            f"- Time: {ts}\n"
+            f"- Market: {market_question[:80]}\n"
         )
-        if opp.settlement_date:
-            text += f"Settles: {opp.settlement_date[:10]}\n"
+        await self.send_markdown(f"{mode} {direction} {symbol}", text)
 
-        url = f"https://api.telegram.org/bot{self._tg_token}/sendMessage"
-        payload = {"chat_id": self._tg_chat_id, "text": text, "parse_mode": "Markdown"}
+    async def send_signal(self, symbol: str, direction: str, momentum: float, price: float):
+        ts = datetime.now().strftime("%H:%M:%S")
+        arrow = "🔺" if direction == "UP" else "🔻"
+        await self.send_text(
+            f"{arrow} Signal: {direction} {symbol} "
+            f"momentum={momentum:+.2%} @ ${price:,.2f} [{ts}]"
+        )
 
+    async def send_startup(self, mode: str, symbols: list[str]):
+        sym_str = ", ".join(symbols)
+        await self.send_markdown(
+            "Pipeline Started",
+            f"**{self._keyword} Pipeline Started**\n\n"
+            f"- Mode: **{mode}**\n"
+            f"- Symbols: {sym_str}\n"
+            f"- Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n",
+        )
+
+    async def _post(self, body: dict):
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)):
-                    pass
+                async with session.post(
+                    self._url,
+                    json=body,
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    result = await resp.json()
+                    if result.get("errcode") != 0:
+                        logger.warning(f"DingTalk error: {result}")
         except Exception as e:
-            logger.warning(f"Telegram send failed: {e}")
-
-    def clear_cache(self):
-        self._sent.clear()
+            logger.warning(f"DingTalk send failed: {e}")

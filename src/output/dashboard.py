@@ -1,200 +1,219 @@
-"""Rich TUI dashboard for live monitoring of arbitrage opportunities."""
+"""Rich TUI dashboard for real-time monitoring of the latency arb pipeline."""
 
 from __future__ import annotations
 
 import time
-from datetime import datetime, timezone
+from datetime import datetime
+from typing import TYPE_CHECKING
 
-from rich.console import Console
 from rich.layout import Layout
-from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from src.data.market_store import MarketStore
-from src.output.db import get_connection, get_open_trades, get_trade_summary
-from src.strategies.base import Action, Opportunity
+from src.output.db import get_connection, get_trade_summary
 
-console = Console()
+if TYPE_CHECKING:
+    from src.main import Pipeline
 
 
-def _format_edge(edge: float) -> Text:
-    if edge >= 5.0:
-        return Text(f"{edge:.2f}%", style="bold green")
-    elif edge >= 3.0:
-        return Text(f"{edge:.2f}%", style="green")
-    elif edge >= 1.0:
-        return Text(f"{edge:.2f}%", style="yellow")
+def _truncate(s: str, max_len: int = 50) -> str:
+    return s[: max_len - 2] + ".." if len(s) > max_len else s
+
+
+def build_prices_panel(pipeline: Pipeline) -> Panel:
+    text = Text()
+    for symbol in sorted(pipeline.last_prices):
+        price = pipeline.last_prices[symbol]
+        label = symbol.upper().replace("USDT", "")
+        text.append(f"  {label:<5}", style="bold cyan")
+        text.append(f"${price:>10,.2f}\n", style="white")
+    if not pipeline.last_prices:
+        text.append("  Connecting to Binance...", style="dim")
+    return Panel(text, title="Prices (Binance)", border_style="cyan")
+
+
+def build_signals_table(pipeline: Pipeline) -> Table:
+    table = Table(title="Signals", expand=True, border_style="yellow")
+    table.add_column("Time", width=8)
+    table.add_column("Sym", width=5)
+    table.add_column("Dir", width=5)
+    table.add_column("Price", width=11, justify="right")
+    table.add_column("Move", width=8, justify="right")
+
+    for sig in reversed(pipeline.signals[-12:]):
+        ts = datetime.fromtimestamp(sig.timestamp).strftime("%H:%M:%S")
+        is_up = sig.direction.value == "UP"
+        style = "green" if is_up else "red"
+        sym = sig.symbol.upper().replace("USDT", "")
+        table.add_row(
+            ts,
+            sym,
+            Text(sig.direction.value, style=f"bold {style}"),
+            f"${sig.price:,.2f}",
+            Text(f"{sig.momentum_pct:+.2%}", style=style),
+        )
+    if not pipeline.signals:
+        table.add_row("", "", Text("waiting...", style="dim"), "", "")
+    return table
+
+
+def build_trades_table(pipeline: Pipeline) -> Table:
+    table = Table(title="Trades", expand=True, border_style="green")
+    table.add_column("Time", width=8)
+    table.add_column("Sym", width=5)
+    table.add_column("Dir", width=5)
+    table.add_column("Price", width=7, justify="right")
+    table.add_column("Shares", width=7, justify="right")
+    table.add_column("Cost", width=9, justify="right")
+    table.add_column("Market", width=38)
+    table.add_column("", width=6)
+
+    for trade in reversed(pipeline.executor.recent_trades[-12:]):
+        ts = datetime.fromtimestamp(trade.timestamp).strftime("%H:%M:%S")
+        is_up = trade.direction == "UP"
+        style = "green" if is_up else "red"
+        mode = Text("PAPER", style="yellow") if trade.is_paper else Text("LIVE", style="bold red")
+        sym = trade.signal.symbol.upper().replace("USDT", "")
+        table.add_row(
+            ts,
+            sym,
+            Text(trade.direction, style=f"bold {style}"),
+            f"${trade.price:.3f}",
+            f"{trade.shares:.1f}",
+            f"${trade.cost_usd:.2f}",
+            _truncate(trade.market.question, 38),
+            mode,
+        )
+    if not pipeline.executor.recent_trades:
+        table.add_row("", "", "", "", "", "", Text("no trades yet", style="dim"), "")
+    return table
+
+
+def build_markets_table(pipeline: Pipeline) -> Table:
+    table = Table(title="Active Markets", expand=True, border_style="magenta")
+    table.add_column("Sym", width=5)
+    table.add_column("Dir", width=5)
+    table.add_column("YES", width=7, justify="right")
+    table.add_column("NO", width=7, justify="right")
+    table.add_column("Left", width=7, justify="right")
+    table.add_column("Question", width=45)
+
+    markets = sorted(pipeline.registry.all_markets, key=lambda m: m.secs_remaining)
+    for m in markets:
+        secs = m.secs_remaining
+        if secs < 5:
+            continue
+        sym = m.symbol.upper().replace("USDT", "")
+        dir_style = "green" if m.direction == "UP" else "red"
+        mins, sec = divmod(int(secs), 60)
+        remaining = f"{mins}m{sec:02d}s"
+        time_style = "bold red" if secs < 60 else "yellow" if secs < 180 else "dim"
+        table.add_row(
+            sym,
+            Text(m.direction, style=dir_style),
+            f"${m.yes_price:.3f}",
+            f"${m.no_price:.3f}",
+            Text(remaining, style=time_style),
+            _truncate(m.question, 45),
+        )
+    if not markets:
+        table.add_row("", "", "", "", "", Text("scanning...", style="dim"))
+    return table
+
+
+def build_status_panel(pipeline: Pipeline) -> Panel:
+    uptime = time.time() - pipeline.start_time if pipeline.start_time > 0 else 0
+    h, rem = divmod(int(uptime), 3600)
+    m, s = divmod(rem, 60)
+
+    text = Text()
+    text.append(f" {datetime.now().strftime('%H:%M:%S')}", style="bold")
+    text.append(f"  up {h:02d}:{m:02d}:{s:02d}\n")
+    text.append(f" Ticks:    {pipeline.ticks_count:>10,}\n")
+    text.append(f" Signals:  {pipeline.signals_count:>10}\n")
+    text.append(f" Guarded:  {pipeline.guard.suppressed_count:>10}\n")
+    text.append(f" Passed:   {pipeline.guards_passed:>10}\n")
+    text.append(f" Trades:   {pipeline.executor.trade_count:>10}\n")
+    text.append(f" Spent:    ${pipeline.executor.total_cost:>9,.2f}\n")
+    text.append(" Mode:     ", style="bold")
+    if pipeline.config.get("risk", {}).get("dry_run", True):
+        text.append("PAPER", style="bold yellow")
     else:
-        return Text(f"{edge:.2f}%", style="dim")
+        text.append("LIVE", style="bold red")
 
+    binance_ok = pipeline.stream.connected
+    poly_ok = pipeline.registry.market_count > 0
+    text.append(f"\n Binance:  ", style="bold")
+    text.append("connected" if binance_ok else "connecting...", style="green" if binance_ok else "red")
+    text.append(f"\n Markets:  ", style="bold")
+    text.append(
+        f"{pipeline.registry.market_count} active" if poly_ok else "scanning...",
+        style="green" if poly_ok else "yellow",
+    )
 
-def _format_action(action: Action) -> Text:
-    styles = {
-        Action.BUY_ALL_YES: ("BUY ALL YES", "bold cyan"),
-        Action.BUY_ALL_NO: ("BUY ALL NO", "bold magenta"),
-        Action.BUY_YES: ("BUY YES", "cyan"),
-        Action.BUY_NO: ("BUY NO", "magenta"),
-        Action.CROSS_ARB: ("CROSS ARB", "bold yellow"),
-        Action.SKIP: ("SKIP", "dim"),
-    }
-    label, style = styles.get(action, (str(action), "white"))
-    return Text(label, style=style)
-
-
-def _truncate(s: str, max_len: int = 45) -> str:
-    return s[:max_len - 2] + ".." if len(s) > max_len else s
-
-
-def build_opportunities_table(opportunities: list[Opportunity]) -> Table:
-    table = Table(title="Live Opportunities", expand=True, border_style="blue")
-    table.add_column("#", width=3, justify="right")
-    table.add_column("Strategy", width=14)
-    table.add_column("Event", width=42)
-    table.add_column("Action", width=14)
-    table.add_column("Edge", width=8, justify="right")
-    table.add_column("YES Sum", width=8, justify="right")
-    table.add_column("Outcomes", width=8, justify="right")
-    table.add_column("Volume", width=12, justify="right")
-    table.add_column("Settles", width=12)
-
-    for i, opp in enumerate(opportunities[:20], 1):
-        details = opp.details
-        yes_sum = details.get("yes_sum", "")
-        yes_sum_str = f"${yes_sum}" if yes_sum else ""
-        vol = details.get("total_volume", 0)
-        vol_str = f"${vol:,.0f}" if vol else ""
-        outcomes = details.get("outcome_count", "")
-
-        settle = ""
-        if opp.settlement_date:
-            try:
-                dt = datetime.fromisoformat(opp.settlement_date.replace("Z", "+00:00"))
-                days = (dt - datetime.now(timezone.utc)).days
-                settle = f"{days}d" if days >= 0 else "expired"
-            except (ValueError, TypeError):
-                settle = opp.settlement_date[:10]
-
-        table.add_row(
-            str(i),
-            opp.strategy[:14],
-            _truncate(opp.event_title),
-            _format_action(opp.action),
-            _format_edge(opp.edge_pct),
-            yes_sum_str,
-            str(outcomes),
-            vol_str,
-            settle,
-        )
-
-    if not opportunities:
-        table.add_row("", "", Text("No opportunities detected", style="dim"), "", "", "", "", "", "")
-
-    return table
-
-
-def build_negrisk_detail_table(store: MarketStore) -> Table:
-    """Show all NegRisk events and their YES sums."""
-    events = store.get_negrisk_events()
-    events.sort(key=lambda e: abs(e.deviation), reverse=True)
-
-    table = Table(title="NegRisk Events (by deviation)", expand=True, border_style="cyan")
-    table.add_column("Event", width=45)
-    table.add_column("Outcomes", width=8, justify="right")
-    table.add_column("YES Sum", width=10, justify="right")
-    table.add_column("Deviation", width=10, justify="right")
-    table.add_column("Volume", width=12, justify="right")
-
-    for e in events[:15]:
-        dev = e.deviation
-        if abs(dev) >= 0.03:
-            dev_style = "bold green" if dev > 0 else "bold red"
-        elif abs(dev) >= 0.01:
-            dev_style = "yellow"
-        else:
-            dev_style = "dim"
-
-        table.add_row(
-            _truncate(e.title),
-            str(e.outcome_count),
-            f"${e.yes_price_sum:.4f}",
-            Text(f"{dev:+.4f}", style=dev_style),
-            f"${e.total_volume:,.0f}",
-        )
-
-    return table
+    return Panel(text, title="Status", border_style="blue")
 
 
 def build_pnl_panel() -> Panel:
     try:
         conn = get_connection()
         summary = get_trade_summary(conn)
-        open_trades = get_open_trades(conn)
         conn.close()
     except Exception:
-        return Panel("DB not initialized", title="P&L", border_style="red")
+        return Panel(" DB not ready", title="P&L", border_style="red")
 
     total = summary.get("total_trades", 0)
     wins = summary.get("wins", 0)
     pnl = summary.get("total_pnl", 0.0) or 0.0
     win_rate = (wins / total * 100) if total > 0 else 0
 
-    pnl_style = "green" if pnl >= 0 else "red"
     text = Text()
-    text.append(f"Total P&L: ", style="bold")
-    text.append(f"${pnl:+,.2f}\n", style=pnl_style)
-    text.append(f"Trades: {total}  Wins: {wins}  Win Rate: {win_rate:.1f}%\n")
-    text.append(f"Open positions: {len(open_trades)}\n")
+    text.append(f" P&L:     ", style="bold")
+    text.append(f"${pnl:+,.2f}\n", style="green" if pnl >= 0 else "red")
+    text.append(f" Resolved: {total}  Wins: {wins}\n")
+    text.append(f" Win Rate: {win_rate:.1f}%\n")
 
-    return Panel(text, title="Portfolio", border_style="green")
-
-
-def build_status_panel(scan_count: int, last_scan: float) -> Panel:
-    now = time.time()
-    elapsed = now - last_scan if last_scan > 0 else 0
-    ts = datetime.now().strftime("%H:%M:%S")
-
-    text = Text()
-    text.append(f"Time: {ts}\n", style="bold")
-    text.append(f"Scans: {scan_count}\n")
-    text.append(f"Last scan: {elapsed:.1f}s ago\n")
-    text.append("Mode: ", style="bold")
-    text.append("PAPER TRADING", style="bold yellow")
-
-    return Panel(text, title="Status", border_style="yellow")
+    return Panel(text, title="P&L (Resolved)", border_style="green")
 
 
-def build_layout(
-    opportunities: list[Opportunity],
-    store: MarketStore,
-    scan_count: int = 0,
-    last_scan: float = 0.0,
-) -> Layout:
+def build_dashboard(pipeline: Pipeline) -> Layout:
     layout = Layout()
     layout.split_column(
         Layout(name="header", size=3),
-        Layout(name="body"),
-        Layout(name="footer", size=8),
+        Layout(name="top", size=14),
+        Layout(name="middle"),
+        Layout(name="bottom", size=14),
     )
 
     layout["header"].update(
         Panel(
-            Text("PolyArbitrage Scanner", style="bold white on blue", justify="center"),
+            Text(
+                "PolyArbitrage — Latency Arb Pipeline",
+                style="bold white on blue",
+                justify="center",
+            ),
             border_style="blue",
         )
     )
 
-    layout["body"].split_row(
-        Layout(name="opportunities", ratio=3),
-        Layout(name="negrisk", ratio=2),
+    layout["top"].split_row(
+        Layout(name="prices", ratio=1),
+        Layout(name="markets", ratio=3),
     )
-    layout["opportunities"].update(build_opportunities_table(opportunities))
-    layout["negrisk"].update(build_negrisk_detail_table(store))
+    layout["prices"].update(build_prices_panel(pipeline))
+    layout["markets"].update(build_markets_table(pipeline))
 
-    layout["footer"].split_row(
-        Layout(build_pnl_panel(), ratio=2),
-        Layout(build_status_panel(scan_count, last_scan), ratio=1),
+    layout["middle"].split_row(
+        Layout(name="signals", ratio=2),
+        Layout(name="trades", ratio=3),
+    )
+    layout["signals"].update(build_signals_table(pipeline))
+    layout["trades"].update(build_trades_table(pipeline))
+
+    layout["bottom"].split_row(
+        Layout(build_status_panel(pipeline), ratio=1),
+        Layout(build_pnl_panel(), ratio=1),
     )
 
     return layout
