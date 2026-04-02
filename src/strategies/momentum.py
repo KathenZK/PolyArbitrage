@@ -124,7 +124,13 @@ class PriceComparator:
         ratio = market.official_current_price / market.official_binance_ref_price
         if ratio <= 0:
             return 0.0
-        return binance_price * ratio
+        projected = binance_price * ratio
+
+        cal_age = market.official_calibration_age
+        if cal_age > 30:
+            blend = min(1.0, (cal_age - 30) / 60.0)
+            projected = projected * (1 - blend) + binance_price * blend
+        return projected
 
     def check(self, binance_symbol: str, price: float, timestamp: float) -> Signal | None:
         market = self._registry.get_market(binance_symbol)
@@ -145,8 +151,8 @@ class PriceComparator:
         projected_official_price = 0.0
         official_deviation = 0.0
         using_official = False
-        official_age = market.official_price_age
-        if market.has_official_calibration and official_age <= self._official_max_age:
+        cal_age = market.official_calibration_age
+        if market.has_official_calibration and cal_age <= self._official_max_age:
             projected_official_price = self._project_official_price(market, price)
             if projected_official_price > 0 and market.official_opening_price > 0:
                 official_deviation = (

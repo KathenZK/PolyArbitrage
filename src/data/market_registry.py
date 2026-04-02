@@ -75,6 +75,7 @@ class CryptoMarket:
     official_current_price: float = 0.0
     official_binance_ref_price: float = 0.0
     official_price_updated_at: float = 0.0
+    official_binance_ref_ts: float = 0.0
 
     @property
     def secs_remaining(self) -> float:
@@ -109,6 +110,13 @@ class CryptoMarket:
         if self.official_price_updated_at <= 0:
             return float("inf")
         return max(0.0, time.time() - self.official_price_updated_at)
+
+    @property
+    def official_calibration_age(self) -> float:
+        ts = self.official_binance_ref_ts if self.official_binance_ref_ts > 0 else self.official_price_updated_at
+        if ts <= 0:
+            return float("inf")
+        return max(0.0, time.time() - ts)
 
     def taker_fee(self, shares: float, price: float) -> float:
         if not self.fees_enabled:
@@ -237,6 +245,7 @@ class MarketRegistry:
         latest_binance = self._latest_buffered_price(market.binance_symbol)
         if latest_binance > 0:
             market.official_binance_ref_price = latest_binance
+            market.official_binance_ref_ts = time.time()
 
     async def refresh(self):
         ws = current_window_start()
@@ -274,6 +283,7 @@ class MarketRegistry:
                     market.official_current_price = old.official_current_price
                     market.official_binance_ref_price = old.official_binance_ref_price
                     market.official_price_updated_at = old.official_price_updated_at
+                    market.official_binance_ref_ts = old.official_binance_ref_ts
 
                 self._markets[binance_sym] = market
 
@@ -287,19 +297,27 @@ class MarketRegistry:
                             f"${best_p:,.2f} ({delta:+.1f}s from window start)"
                         )
 
-                if (
-                    market.official_price_age >= self._official_refresh_interval
-                    or not market.has_official_opening_price
-                    or not market.has_official_current_price
-                ):
-                    await self._refresh_official_metadata(market)
-
             except asyncio.TimeoutError:
                 logger.warning(f"Timeout fetching {slug}")
             except Exception as e:
                 logger.warning(f"Error fetching {slug}: {e}")
 
         self._current_window = ws
+
+        stale = [
+            m for m in self._markets.values()
+            if m.secs_remaining > 10
+            and (
+                m.official_price_age >= self._official_refresh_interval
+                or not m.has_official_opening_price
+                or not m.has_official_current_price
+            )
+        ]
+        if stale:
+            await asyncio.gather(
+                *(self._refresh_official_metadata(m) for m in stale),
+                return_exceptions=True,
+            )
 
         active = [m for m in self._markets.values() if m.secs_remaining > 10]
         if active:

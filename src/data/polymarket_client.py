@@ -10,8 +10,8 @@ CLOB client uses the official py-clob-client SDK with:
 
 from __future__ import annotations
 
+import json
 import logging
-import re
 import time
 from typing import Any
 
@@ -91,25 +91,46 @@ class PolymarketGammaClient:
 
     @staticmethod
     def _parse_event_page_metadata(slug: str, html: str) -> dict[str, float]:
-        pattern = re.compile(
-            rf'"slug":"{re.escape(slug)}".*?"eventMetadata":\{{"finalPrice":(?P<final>[^,}}]+),"priceToBeat":(?P<beat>[^,}}]+)\}}',
-            re.DOTALL,
-        )
-        match = pattern.search(html)
-        if not match:
+        start_tag = '<script id="__NEXT_DATA__" type="application/json">'
+        start_idx = html.find(start_tag)
+        if start_idx < 0:
+            return {}
+        json_start = start_idx + len(start_tag)
+        end_idx = html.find("</script>", json_start)
+        if end_idx < 0:
             return {}
 
         try:
-            final_price = float(match.group("final"))
-            price_to_beat = float(match.group("beat"))
-        except (TypeError, ValueError):
+            payload = json.loads(html[json_start:end_idx])
+        except (json.JSONDecodeError, ValueError):
             return {}
 
-        return {
-            "official_current_price": final_price,
-            "official_opening_price": price_to_beat,
-            "fetched_at": time.time(),
-        }
+        data_list = (
+            payload
+            .get("props", {})
+            .get("pageProps", {})
+            .get("data", [])
+        )
+        if not isinstance(data_list, list):
+            return {}
+
+        for entry in data_list:
+            if not isinstance(entry, dict) or entry.get("slug") != slug:
+                continue
+            meta = entry.get("eventMetadata")
+            if not isinstance(meta, dict):
+                continue
+            try:
+                final_price = float(meta["finalPrice"])
+                price_to_beat = float(meta["priceToBeat"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            return {
+                "official_current_price": final_price,
+                "official_opening_price": price_to_beat,
+                "fetched_at": time.time(),
+            }
+        return {}
 
     async def get_event_page_metadata(self, slug: str) -> dict[str, float]:
         """Fetch the official event page metadata exposed to users.

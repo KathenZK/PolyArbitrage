@@ -135,6 +135,7 @@ def _build_market(row: dict[str, Any]) -> CryptoMarket:
         official_current_price=_parse_float(row, "official_current_price", 0.0),
         official_binance_ref_price=_parse_float(row, "official_binance_ref_price", 0.0),
         official_price_updated_at=_parse_float(row, "official_price_updated_at", 0.0),
+        official_binance_ref_ts=_parse_float(row, "official_binance_ref_ts", 0.0),
     )
 
 
@@ -168,9 +169,17 @@ def signal_from_row(
     projected_official_price = 0.0
     official_deviation = 0.0
     using_official = False
-    official_age = max(0.0, _parse_float(row, "timestamp", time.time()) - market.official_price_updated_at)
-    if market.has_official_calibration and official_age <= official_max_age_secs:
-        projected_official_price = binance_price * (market.official_current_price / market.official_binance_ref_price)
+    row_ts = _parse_float(row, "timestamp", time.time())
+    ref_ts = market.official_binance_ref_ts if market.official_binance_ref_ts > 0 else market.official_price_updated_at
+    cal_age = max(0.0, row_ts - ref_ts) if ref_ts > 0 else float("inf")
+    if market.has_official_calibration and cal_age <= official_max_age_secs:
+        ratio = market.official_current_price / market.official_binance_ref_price
+        raw_projection = binance_price * ratio
+        if cal_age > 30:
+            blend = min(1.0, (cal_age - 30) / 60.0)
+            projected_official_price = raw_projection * (1 - blend) + binance_price * blend
+        else:
+            projected_official_price = raw_projection
         official_deviation = (
             projected_official_price - market.official_opening_price
         ) / market.official_opening_price

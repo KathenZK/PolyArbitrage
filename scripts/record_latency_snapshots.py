@@ -172,6 +172,7 @@ class SnapshotRecorder:
             "official_current_price": market.official_current_price,
             "official_binance_ref_price": market.official_binance_ref_price,
             "official_price_updated_at": market.official_price_updated_at,
+            "official_binance_ref_ts": market.official_binance_ref_ts,
             "deviation_pct": deviation,
             "market_id": market.market_id,
             "market_slug": market.slug,
