@@ -257,11 +257,11 @@ def build_trades_table(pipeline: Pipeline) -> Table:
     table.add_column("方向", width=5)
     table.add_column("状态", width=10)
     table.add_column("成交", width=7, justify="right")
-    table.add_column("f*", width=5, justify="right")
-    table.add_column("q", width=5, justify="right")
-    table.add_column("p", width=5, justify="right")
-    table.add_column("EV", width=7, justify="right")
-    table.add_column("$", width=7, justify="right")
+    table.add_column("成交率", width=5, justify="right")
+    table.add_column("报价", width=5, justify="right")
+    table.add_column("胜率", width=5, justify="right")
+    table.add_column("期望", width=7, justify="right")
+    table.add_column("金额", width=7, justify="right")
     table.add_column("", width=5)
 
     now = time.time()
@@ -429,12 +429,12 @@ def build_stats_panel(pipeline: Pipeline) -> Panel:
 
     t.append(f" 交易: {len(trades)}")
     t.append(f"  已成交: {len(filled)}\n")
-    t.append(" 提交EV: ")
+    t.append(" 提交期望: ")
     t.append(
         f"${total_submitted_ev:+,.2f}",
         style="green" if total_submitted_ev >= 0 else "red",
     )
-    t.append("  匹配EV: ")
+    t.append("  匹配期望: ")
     t.append(
         f"${total_matched_ev:+,.2f}\n",
         style="green" if total_matched_ev >= 0 else "red",
@@ -458,7 +458,7 @@ def build_stats_panel(pipeline: Pipeline) -> Panel:
     )
 
     t.append(f" 平均胜率: {avg_p:.1%}" if filled else " 平均胜率: --")
-    t.append(f"  平均f*: {avg_fill:.1%}\n" if trades else "  平均f*: --\n")
+    t.append(f"  平均成交率: {avg_fill:.1%}\n" if trades else "  平均成交率: --\n")
 
     if trades:
         t.append(f" 置信度: {avg_conf:.1%}")
