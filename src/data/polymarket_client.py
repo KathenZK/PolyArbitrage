@@ -1,6 +1,8 @@
 """Polymarket API clients: Gamma (REST) for market discovery, CLOB for trading.
 
 CLOB client uses the official py-clob-client SDK with:
+  - official L1 -> L2 auth flow (private key + API creds)
+  - configurable signature type / funder for EOA vs proxy wallets
   - Post-Only orders (guarantees maker status, 0% fee)
   - GTD expiration (auto-cancel at window end)
   - Proper options (tick_size, neg_risk)
@@ -88,21 +90,56 @@ class PolymarketGammaClient:
 class PolymarketCLOBClient:
     """Wrapper around py-clob-client with post-only + GTD support."""
 
-    def __init__(self, private_key: str, chain_id: int = 137):
+    def __init__(
+        self,
+        private_key: str,
+        chain_id: int = 137,
+        *,
+        signature_type: int = 0,
+        funder: str = "",
+        api_key: str = "",
+        api_secret: str = "",
+        api_passphrase: str = "",
+    ):
         self._key = private_key
         self._chain_id = chain_id
+        self._signature_type = signature_type
+        self._funder = funder
+        self._api_key = api_key
+        self._api_secret = api_secret
+        self._api_passphrase = api_passphrase
         self._client = None
 
     def _ensure_client(self):
         if self._client is None:
-            from py_clob_client.client import ClobClient
+            try:
+                from py_clob_client.client import ClobClient
+            except ModuleNotFoundError as exc:
+                raise RuntimeError(
+                    "py-clob-client is not installed. Run `pip install -r requirements.txt` "
+                    "before enabling live Polymarket trading."
+                ) from exc
 
-            self._client = ClobClient(
-                host="https://clob.polymarket.com",
-                chain_id=self._chain_id,
-                key=self._key,
-            )
-            self._client.set_api_creds(self._client.create_or_derive_api_creds())
+            client_kwargs = {
+                "host": "https://clob.polymarket.com",
+                "chain_id": self._chain_id,
+                "key": self._key,
+                "signature_type": self._signature_type,
+            }
+            if self._funder:
+                client_kwargs["funder"] = self._funder
+
+            self._client = ClobClient(**client_kwargs)
+            if self._api_key and self._api_secret and self._api_passphrase:
+                self._client.set_api_creds(
+                    {
+                        "key": self._api_key,
+                        "secret": self._api_secret,
+                        "passphrase": self._api_passphrase,
+                    }
+                )
+            else:
+                self._client.set_api_creds(self._client.create_or_derive_api_creds())
         return self._client
 
     def get_orderbook(self, token_id: str) -> Any:

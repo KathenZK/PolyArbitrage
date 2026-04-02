@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+import types
 import unittest
 
 from src.data.polymarket_client import PolymarketCLOBClient
@@ -43,6 +45,59 @@ class PolymarketClientTests(unittest.TestCase):
         bid_depth, ask_depth = client.get_book_depth("token")
         self.assertAlmostEqual(bid_depth, 2.4, places=6)
         self.assertAlmostEqual(ask_depth, 3.57, places=6)
+
+    def test_client_init_passes_signature_type_funder_and_api_creds(self):
+        events: list[tuple[str, object]] = []
+
+        class FakeClobClient:
+            def __init__(self, **kwargs):
+                events.append(("init", kwargs))
+
+            def set_api_creds(self, creds):
+                events.append(("set_api_creds", creds))
+
+            def create_or_derive_api_creds(self):
+                events.append(("derive", None))
+                return {"key": "derived", "secret": "derived", "passphrase": "derived"}
+
+        fake_client_mod = types.ModuleType("py_clob_client.client")
+        fake_client_mod.ClobClient = FakeClobClient
+        fake_root_mod = types.ModuleType("py_clob_client")
+        fake_root_mod.client = fake_client_mod
+
+        original_root = sys.modules.get("py_clob_client")
+        original_client = sys.modules.get("py_clob_client.client")
+        sys.modules["py_clob_client"] = fake_root_mod
+        sys.modules["py_clob_client.client"] = fake_client_mod
+        try:
+            client = PolymarketCLOBClient(
+                "test-key",
+                signature_type=0,
+                funder="0xFunder",
+                api_key="key123",
+                api_secret="secret123",
+                api_passphrase="pass123",
+            )
+            client._ensure_client()
+        finally:
+            if original_root is None:
+                sys.modules.pop("py_clob_client", None)
+            else:
+                sys.modules["py_clob_client"] = original_root
+            if original_client is None:
+                sys.modules.pop("py_clob_client.client", None)
+            else:
+                sys.modules["py_clob_client.client"] = original_client
+
+        init_event = next(payload for kind, payload in events if kind == "init")
+        self.assertEqual(init_event["host"], "https://clob.polymarket.com")
+        self.assertEqual(init_event["chain_id"], 137)
+        self.assertEqual(init_event["key"], "test-key")
+        self.assertEqual(init_event["signature_type"], 0)
+        self.assertEqual(init_event["funder"], "0xFunder")
+
+        self.assertIn(("set_api_creds", {"key": "key123", "secret": "secret123", "passphrase": "pass123"}), events)
+        self.assertFalse(any(kind == "derive" for kind, _ in events))
 
 
 if __name__ == "__main__":

@@ -7,7 +7,7 @@ For post-only maker orders the submitted-order EV is lower because:
     - the order may not fill
     - fills can be adversely selected
 
-This module still gates on filled-bet EV, but now persists every order and
+This module gates on fill-adjusted submitted EV, persists every order, and
 reconciles pending orders against Polymarket so the runtime state matches
 what actually happened on the venue.
 """
@@ -225,9 +225,28 @@ class Executor:
             pk = os.getenv("POLYMARKET_PRIVATE_KEY", "")
             if not pk:
                 raise RuntimeError("POLYMARKET_PRIVATE_KEY not set")
+            signature_type_raw = os.getenv("POLYMARKET_SIGNATURE_TYPE", "0").strip() or "0"
+            try:
+                signature_type = int(signature_type_raw)
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"Invalid POLYMARKET_SIGNATURE_TYPE={signature_type_raw!r}; expected an integer"
+                ) from exc
+
+            funder = os.getenv("POLYMARKET_FUNDER", "").strip()
+            api_key = os.getenv("POLYMARKET_API_KEY", "").strip()
+            api_secret = os.getenv("POLYMARKET_API_SECRET", "").strip()
+            api_passphrase = os.getenv("POLYMARKET_API_PASSPHRASE", "").strip()
             from src.data.polymarket_client import PolymarketCLOBClient
 
-            self._clob = PolymarketCLOBClient(pk)
+            self._clob = PolymarketCLOBClient(
+                pk,
+                signature_type=signature_type,
+                funder=funder,
+                api_key=api_key,
+                api_secret=api_secret,
+                api_passphrase=api_passphrase,
+            )
         return self._clob
 
     @staticmethod
