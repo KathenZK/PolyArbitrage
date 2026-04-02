@@ -264,11 +264,24 @@ class Pipeline:
         console.print(f"  Allow:   {allowance_text}")
         for warning in report.warnings:
             console.print(f"  Warn:    {warning}")
-        redeem_status = self.redeemer.status()
-        if redeem_status.armed:
+
+        redeem_report = await self.redeemer.preflight()
+        if not redeem_report.ok:
+            console.print("[bold red]Redeem preflight failed[/bold red]")
+            for issue in redeem_report.issues:
+                console.print(f"  - {issue}")
+            return False
+
+        if redeem_report.enabled:
             console.print("  Redeem:  armed")
+            console.print(f"  Owner:   {redeem_report.owner or '?'}")
+            console.print(f"  Proxy:   {redeem_report.derived_proxy or '?'}")
+            if redeem_report.relay_address:
+                console.print(f"  Relay:   {redeem_report.relay_address} (nonce {redeem_report.relay_nonce or '0'})")
+            for warning in redeem_report.warnings:
+                console.print(f"  Warn:    {warning}")
         else:
-            console.print(f"  Redeem:  disabled ({redeem_status.reason})")
+            console.print("  Redeem:  disabled in config")
         return True
 
     async def run(self):
@@ -297,6 +310,7 @@ class Pipeline:
         registry_task = asyncio.create_task(self.registry.run())
         await self.registry.refresh()
         self.executor.bootstrap_pending_orders()
+        self.executor.bootstrap_wallet_orders()
         await self.executor.reconcile_pending_orders(force=True)
         self.redeemer.attach_clob(self.executor._clob)
 
@@ -344,6 +358,7 @@ class Pipeline:
         registry_task = asyncio.create_task(self.registry.run())
         await self.registry.refresh()
         self.executor.bootstrap_pending_orders()
+        self.executor.bootstrap_wallet_orders()
         await self.executor.reconcile_pending_orders(force=True)
         self.redeemer.attach_clob(self.executor._clob)
         reconcile_task = asyncio.create_task(self._reconcile_loop())

@@ -117,6 +117,65 @@ class RedeemerTests(unittest.IsolatedAsyncioTestCase):
         calldata = ProxyRedeemer._encode_redeem_positions(DEFAULT_COLLATERAL, condition_id)
         self.assertTrue(calldata.startswith("0x01b7037c"))
 
+    async def test_preflight_checks_relayer_payload_and_auth(self):
+        owner_pk = "0x" + "22" * 32
+        owner = Account.from_key(owner_pk).address
+        funder = ProxyRedeemer._derive_proxy_wallet(owner)
+        gamma = FakeGamma([])
+
+        with patch.dict(
+            "os.environ",
+            {
+                "POLYMARKET_PRIVATE_KEY": owner_pk,
+                "POLYMARKET_FUNDER": funder,
+                "RELAYER_API_KEY": "relayer-key",
+                "RELAYER_API_KEY_ADDRESS": "0xrelay",
+            },
+            clear=False,
+        ):
+            worker = ProxyRedeemer(gamma, poll_interval_secs=1)
+            worker._relayer_request = AsyncMock(  # type: ignore[method-assign]
+                side_effect=[
+                    {"address": "0xfeed", "nonce": "9"},
+                    [{"address": "0xrelay", "label": "pilot"}],
+                ]
+            )
+            report = await worker.preflight()
+
+        self.assertTrue(report.ok)
+        self.assertEqual(report.relay_address, "0xfeed")
+        self.assertEqual(report.relay_nonce, "9")
+        self.assertEqual(report.api_key_address, "0xrelay")
+        self.assertEqual(report.issues, [])
+
+    async def test_preflight_detects_relayer_api_key_address_mismatch(self):
+        owner_pk = "0x" + "33" * 32
+        owner = Account.from_key(owner_pk).address
+        funder = ProxyRedeemer._derive_proxy_wallet(owner)
+        gamma = FakeGamma([])
+
+        with patch.dict(
+            "os.environ",
+            {
+                "POLYMARKET_PRIVATE_KEY": owner_pk,
+                "POLYMARKET_FUNDER": funder,
+                "RELAYER_API_KEY": "relayer-key",
+                "RELAYER_API_KEY_ADDRESS": "0xwrong",
+            },
+            clear=False,
+        ):
+            worker = ProxyRedeemer(gamma, poll_interval_secs=1)
+            worker._relayer_request = AsyncMock(  # type: ignore[method-assign]
+                side_effect=[
+                    {"address": "0xfeed", "nonce": "9"},
+                    [{"address": "0xrelay", "label": "pilot"}],
+                ]
+            )
+            report = await worker.preflight()
+
+        self.assertFalse(report.ok)
+        self.assertTrue(any("RELAYER_API_KEY_ADDRESS" in issue for issue in report.issues))
+
 
 if __name__ == "__main__":
     unittest.main()

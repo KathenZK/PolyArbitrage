@@ -14,8 +14,10 @@ what actually happened on the venue.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
+import random
 import time
 from dataclasses import dataclass
 from enum import Enum
@@ -207,6 +209,7 @@ class Executor:
         self._skipped_live_limits = 0
         self._last_reconcile = 0.0
         self._fill_stats_cache: dict[tuple[str, str, str, str, str], tuple[float, FillEstimate]] = {}
+        self._execute_lock = asyncio.Lock()
 
     @property
     def trade_count(self) -> int:
@@ -677,6 +680,44 @@ class Executor:
                 raw_data=raw_data,
             )
 
+    def bootstrap_wallet_orders(self):
+        """Cross-check CLOB open orders against DB to detect orphaned orders."""
+        if self._dry_run:
+            return
+        try:
+            clob = self._ensure_clob()
+            open_orders = clob.get_open_orders() or []
+        except Exception as exc:
+            logger.warning(f"Wallet order cross-check failed: {exc}")
+            return
+
+        db_order_ids = set()
+        if self._db is not None:
+            for row in get_pending_trades(self._db):
+                oid = str(row.get("order_id", "") or "")
+                if oid:
+                    db_order_ids.add(oid)
+        mem_order_ids = {t.order_id for t in self._orders if t.order_id}
+
+        orphan_count = 0
+        for order in open_orders:
+            order_id = self._extract_order_id(order)
+            if not order_id:
+                continue
+            if order_id in db_order_ids or order_id in mem_order_ids:
+                continue
+
+            orphan_count += 1
+            logger.warning(f"Orphaned CLOB order detected: {order_id} (not in DB)")
+            try:
+                clob.cancel_order(order_id)
+                logger.info(f"Cancelled orphaned order: {order_id}")
+            except Exception as exc:
+                logger.warning(f"Failed to cancel orphan {order_id}: {exc}")
+
+        if orphan_count > 0:
+            logger.warning(f"Found and cancelled {orphan_count} orphaned CLOB order(s)")
+
     def bootstrap_pending_orders(self):
         if self._db is None:
             return
@@ -841,9 +882,8 @@ class Executor:
             q = market.best_bid if market.best_bid > 0 else token_price - self._maker_offset
             reference_bid = market.best_bid if market.best_bid > 0 else q
         else:
-            down_best_bid = (1 - market.best_ask) if market.best_ask > 0 else token_price - self._maker_offset
-            q = max(0.01, down_best_bid)
-            reference_bid = down_best_bid
+            q = max(0.01, token_price - self._maker_offset)
+            reference_bid = q
 
         q = round(max(0.01, min(0.99, q)), 2)
         queue_ticks = max(0.0, (reference_bid - q) / 0.01)
@@ -938,20 +978,27 @@ class Executor:
         if plan is None:
             return None
 
+        async with self._execute_lock:
+            return await self._execute_plan(signal, plan)
+
+    async def _execute_plan(self, signal: Signal, plan: TradePlan) -> TradeResult | None:
         market = plan.market
         raw_response: Any = {}
         last_error = ""
 
         if self._dry_run:
             order_id = f"paper-{len(self._orders) + 1}"
-            status = OrderStatus.FILLED
-            matched_shares = plan.shares
-            matched_cost_usd = round(plan.cost_usd, 6)
+            sim_fill_ratio = min(1.0, plan.expected_fill_ratio + random.uniform(-0.10, 0.10))
+            sim_fill_ratio = max(0.0, sim_fill_ratio)
+            matched_shares = round(plan.shares * sim_fill_ratio, 6)
+            matched_cost_usd = round(matched_shares * plan.price, 6)
+            status = OrderStatus.FILLED if matched_shares > 0 else OrderStatus.EXPIRED
             logger.info(
                 f"[PAPER] {signal.asset} {signal.direction.value} -> buy {plan.token_side} "
                 f"@ ${plan.price:.2f} x {plan.shares:.1f} = ${plan.cost_usd:.2f} | "
                 f"p_adj={plan.win_prob:.1%} fill~{plan.expected_fill_ratio:.1%}/lb {plan.fill_ratio_lower_bound:.1%} "
-                f"fEV=${plan.filled_ev:.2f} sEV=${plan.submitted_ev:.2f}"
+                f"fEV=${plan.filled_ev:.2f} sEV=${plan.submitted_ev:.2f} "
+                f"sim_fill={sim_fill_ratio:.0%}"
             )
         else:
             try:

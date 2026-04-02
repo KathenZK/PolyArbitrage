@@ -15,7 +15,7 @@ import json
 import logging
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from eth_abi import encode
@@ -54,6 +54,20 @@ class RedeemStatus:
     owner: str
     funder: str
     reason: str = ""
+
+
+@dataclass
+class RedeemPreflightReport:
+    ok: bool
+    enabled: bool
+    owner: str
+    funder: str
+    derived_proxy: str
+    relay_address: str = ""
+    relay_nonce: str = ""
+    api_key_address: str = ""
+    issues: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
 
 
 class ProxyRedeemer:
@@ -112,6 +126,69 @@ class ProxyRedeemer:
         if self._require_auth and (not self._relayer_api_key or not self._relayer_api_key_address):
             return RedeemStatus(True, False, self._owner, self._funder, "RELAYER_API_KEY not configured")
         return RedeemStatus(True, True, self._owner, self._funder, "")
+
+    async def preflight(self) -> RedeemPreflightReport:
+        status = self.status()
+        derived_proxy = self._derive_proxy_wallet(self._owner) if self._owner else ""
+        report = RedeemPreflightReport(
+            ok=False,
+            enabled=self._enabled,
+            owner=self._owner,
+            funder=self._funder,
+            derived_proxy=derived_proxy,
+            api_key_address=self._relayer_api_key_address,
+        )
+
+        if not self._enabled:
+            report.ok = True
+            report.warnings.append("redeem worker disabled in config")
+            return report
+
+        if not status.armed:
+            report.issues.append(status.reason or "redeem worker not armed")
+            return report
+
+        try:
+            relay_payload = await self._relayer_request(
+                "GET",
+                "/relay-payload",
+                params={"address": self._owner, "type": "PROXY"},
+                authed=False,
+            )
+            report.relay_address = str(relay_payload.get("address", "") or "")
+            report.relay_nonce = str(relay_payload.get("nonce", "") or "")
+            if not report.relay_address:
+                report.issues.append("relay-payload returned no relay address")
+        except Exception as exc:
+            report.issues.append(f"relay-payload check failed: {exc}")
+            return report
+
+        if self._require_auth or self._relayer_api_key:
+            try:
+                key_rows = await self._relayer_request(
+                    "GET",
+                    "/relayer/api/keys",
+                    authed=True,
+                )
+            except Exception as exc:
+                report.issues.append(f"relayer auth check failed: {exc}")
+                return report
+
+            addresses = {
+                str(row.get("address", "") or "").lower()
+                for row in key_rows
+                if isinstance(row, dict) and row.get("address")
+            } if isinstance(key_rows, list) else set()
+
+            if self._relayer_api_key_address and addresses and self._relayer_api_key_address.lower() not in addresses:
+                report.issues.append(
+                    f"RELAYER_API_KEY_ADDRESS {self._relayer_api_key_address} not returned by /relayer/api/keys"
+                )
+            elif not addresses:
+                report.warnings.append("relayer auth succeeded but /relayer/api/keys returned no address list")
+
+        report.ok = not report.issues
+        return report
 
     async def run_once(self) -> int:
         status = self.status()
