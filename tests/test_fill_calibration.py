@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from src.data.market_registry import CryptoMarket
@@ -104,12 +105,14 @@ class FillCalibrationTests(unittest.TestCase):
 
         fast_decay = Executor(
             dry_run=True,
+            fill_min_samples=1,
             fill_decay_half_life_hours=6,
             fill_prior_strength=4,
             fill_confidence_scale=4,
         )
         slow_decay = Executor(
             dry_run=True,
+            fill_min_samples=1,
             fill_decay_half_life_hours=240,
             fill_prior_strength=4,
             fill_confidence_scale=4,
@@ -126,12 +129,54 @@ class FillCalibrationTests(unittest.TestCase):
         self.assertGreater(fast_plan.fill_confidence, 0)
         self.assertEqual(fast_plan.fill_source, "decayed_history")
 
+    def test_insufficient_fill_samples_stays_heuristic(self):
+        seed_trade(self.conn, matched_ratio=1.0, hours_ago=1)
+        seed_trade(self.conn, matched_ratio=0.0, hours_ago=72)
+
+        executor = Executor(dry_run=True, fill_min_samples=3)
+        executor.attach_db(self.conn)
+
+        plan = executor.evaluate_signal(build_signal())
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.fill_source, "heuristic_insufficient_samples")
+
     def test_heuristic_lower_bound_is_more_conservative_than_mean(self):
         executor = Executor(dry_run=True)
         plan = executor.evaluate_signal(build_signal())
         self.assertIsNotNone(plan)
         self.assertLess(plan.fill_ratio_lower_bound, plan.expected_fill_ratio)
         self.assertEqual(plan.fill_source, "heuristic")
+
+    def test_live_preflight_checks_proxy_wallet_balance_and_allowance(self):
+        class FakeCLOB:
+            def get_signer_address(self):
+                return "0xSigner"
+
+            def get_collateral_balance_allowance(self, signature_type=None):
+                return {
+                    "balance": "8560000",
+                    "allowances": {
+                        "0xspender": "20000000",
+                    },
+                }
+
+        executor = Executor(dry_run=False, bet_size_usd=2)
+        executor._clob = FakeCLOB()
+        with patch.dict(
+            "os.environ",
+            {
+                "POLYMARKET_SIGNATURE_TYPE": "1",
+                "POLYMARKET_FUNDER": "0xFunder",
+            },
+            clear=False,
+        ):
+            report = executor.live_preflight()
+
+        self.assertTrue(report.ok)
+        self.assertEqual(report.signer_address, "0xSigner")
+        self.assertEqual(report.funder_address, "0xFunder")
+        self.assertAlmostEqual(report.collateral_balance, 8.56, places=6)
+        self.assertAlmostEqual(report.max_allowance, 20.0, places=6)
 
 
 if __name__ == "__main__":
