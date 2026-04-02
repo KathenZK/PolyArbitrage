@@ -21,7 +21,7 @@ import random
 import time
 from dataclasses import dataclass
 from enum import Enum
-from math import exp, sqrt
+from math import exp, floor, sqrt
 from typing import Any
 
 from src.data.market_registry import CryptoMarket
@@ -53,6 +53,7 @@ class TradeResult:
     signal: Signal | None
     market: CryptoMarket | None
     asset: str
+    binance_symbol: str
     direction: str
     token_side: str
     token_id: str
@@ -79,6 +80,7 @@ class TradeResult:
     liquidity_at_submit: float = 0.0
     spread_at_submit: float = 0.0
     queue_ticks_at_submit: float = 0.0
+    tick_size_at_submit: float = 0.01
     db_id: int | None = None
     last_error: str = ""
     raw_status: str = ""
@@ -116,6 +118,15 @@ class FillEstimate:
 
 
 @dataclass
+class TokenQuote:
+    token_id: str
+    best_bid: float
+    best_ask: float
+    spread: float
+    tick_size: float
+
+
+@dataclass
 class LivePreflight:
     ok: bool
     signer_address: str
@@ -131,6 +142,7 @@ class LivePreflight:
 class TradePlan:
     signal: Signal
     market: CryptoMarket
+    binance_symbol: str
     direction: str
     token_side: str
     token_id: str
@@ -151,6 +163,7 @@ class TradePlan:
     liquidity_at_submit: float
     spread_at_submit: float
     queue_ticks_at_submit: float
+    tick_size_at_submit: float
 
     @property
     def fill_prob(self) -> float:
@@ -188,7 +201,7 @@ class Executor:
         self._dry_run = dry_run
         self._min_liquidity = min_liquidity
         self._min_ev = min_ev_usd
-        self._maker_offset = maker_offset_ticks * 0.01
+        self._maker_offset_ticks = maker_offset_ticks
         self._haircut = adverse_selection_haircut
         self._reconcile_interval = reconcile_interval_secs
         self._fill_rate_prior = fill_rate_prior
@@ -208,6 +221,8 @@ class Executor:
         self._skipped_no_edge = 0
         self._skipped_live_limits = 0
         self._last_reconcile = 0.0
+        self._last_clob_heartbeat = 0.0
+        self._heartbeat_id = ""
         self._fill_stats_cache: dict[tuple[str, str, str, str, str], tuple[float, FillEstimate]] = {}
         self._execute_lock = asyncio.Lock()
 
@@ -258,6 +273,23 @@ class Executor:
     @property
     def haircut(self) -> float:
         return self._haircut
+
+    @staticmethod
+    def _asset_to_binance_symbol(asset: str) -> str:
+        return f"{asset.lower()}usdt"
+
+    @staticmethod
+    def _round_price_to_tick(price: float, tick_size: float) -> float:
+        tick = max(tick_size, 0.001)
+        upper = max(tick, 1.0 - tick)
+        clipped = max(tick, min(upper, price))
+        ticks = floor((clipped + 1e-12) / tick)
+        rounded = round(ticks * tick, 6)
+        return max(tick, min(upper, rounded))
+
+    @staticmethod
+    def _format_tick_size(tick_size: float) -> str:
+        return f"{max(tick_size, 0.001):.3f}".rstrip("0").rstrip(".")
 
     @property
     def max_daily_orders(self) -> int:
@@ -581,6 +613,74 @@ class Executor:
             warnings=warnings,
         )
 
+    def _fallback_token_quote(self, token_id: str, token_price: float) -> TokenQuote:
+        tick_size = 0.01
+        best_bid = self._round_price_to_tick(token_price - self._maker_offset_ticks * tick_size, tick_size)
+        best_ask = self._round_price_to_tick(token_price + tick_size, tick_size)
+        if best_ask <= best_bid:
+            best_ask = min(1.0 - tick_size, round(best_bid + tick_size, 6))
+        return TokenQuote(
+            token_id=token_id,
+            best_bid=max(tick_size, best_bid),
+            best_ask=max(best_bid, best_ask),
+            spread=max(tick_size, best_ask - best_bid),
+            tick_size=tick_size,
+        )
+
+    def _resolve_token_quote(self, token_id: str, token_price: float) -> TokenQuote:
+        if not self._dry_run:
+            try:
+                clob = self._ensure_clob()
+                snapshot = clob.get_book_snapshot(token_id)
+                tick_size = max(snapshot.tick_size, 0.001)
+                best_bid = max(0.0, snapshot.best_bid)
+                best_ask = max(0.0, snapshot.best_ask)
+                if best_bid > 0 or best_ask > 0:
+                    spread = snapshot.spread if snapshot.spread > 0 else max(tick_size, best_ask - best_bid)
+                    return TokenQuote(
+                        token_id=token_id,
+                        best_bid=best_bid,
+                        best_ask=best_ask,
+                        spread=max(0.0, spread),
+                        tick_size=tick_size,
+                    )
+            except Exception as exc:
+                logger.debug(f"CLOB book snapshot failed for {token_id}: {exc}")
+        return self._fallback_token_quote(token_id, token_price)
+
+    async def send_heartbeat(self, force: bool = False) -> bool:
+        if self._dry_run:
+            return False
+        pending = [trade for trade in self._orders if trade.status == OrderStatus.PENDING]
+        if not pending:
+            self._heartbeat_id = ""
+            return False
+        now = time.time()
+        if not force and now - self._last_clob_heartbeat < 5.0:
+            return False
+        clob = self._ensure_clob()
+        response = clob.post_heartbeat(self._heartbeat_id or None)
+        new_heartbeat_id = self._field(response, "heartbeat_id", "heartbeatId", default="")
+        if new_heartbeat_id:
+            self._heartbeat_id = str(new_heartbeat_id)
+        self._last_clob_heartbeat = now
+        return True
+
+    def _stale_order_reason(self, trade: TradeResult, signal: Signal | None) -> str:
+        if signal is None:
+            return "signal unavailable"
+        if signal.direction.value != trade.direction:
+            return "signal reversed"
+        plan = self.evaluate_signal(signal, count_skips=False, enforce_live_limits=False)
+        if plan is None:
+            return "edge unavailable"
+        if plan.token_id != trade.token_id:
+            return "token changed"
+        tick = max(trade.tick_size_at_submit, plan.tick_size_at_submit, 0.001)
+        if abs(plan.price - trade.price) >= tick - 1e-9:
+            return f"quote moved from {trade.price:.3f} to {plan.price:.3f}"
+        return ""
+
     def _normalize_status(self, raw_status: str, expiration_ts: int = 0) -> OrderStatus | None:
         if raw_status in self._FILLED_STATUSES:
             return OrderStatus.FILLED
@@ -758,6 +858,7 @@ class Executor:
                 signal=None,
                 market=None,
                 asset=str(row.get("asset", "") or ""),
+                binance_symbol=self._asset_to_binance_symbol(str(row.get("asset", "") or "")),
                 direction=str(row.get("action", "") or ""),
                 token_side=str(row.get("side", "") or ""),
                 token_id=str(row.get("token_id", "") or ""),
@@ -784,13 +885,14 @@ class Executor:
                 liquidity_at_submit=float(row.get("liquidity_at_submit", 0) or 0),
                 spread_at_submit=float(row.get("spread_at_submit", 0) or 0),
                 queue_ticks_at_submit=float(row.get("queue_ticks_at_submit", 0) or 0),
+                tick_size_at_submit=0.01,
                 db_id=int(row.get("id", 0) or 0),
                 last_error=str(row.get("last_error", "") or ""),
                 raw_status=status.value,
             )
             self._append_trade(trade)
 
-    async def reconcile_pending_orders(self, force: bool = False) -> int:
+    async def reconcile_pending_orders(self, force: bool = False, signal_lookup=None) -> int:
         if self._dry_run:
             return 0
 
@@ -823,6 +925,20 @@ class Executor:
                     payload = {"status": "expired"}
                 except Exception as exc:
                     logger.debug(f"Cancel after expiry failed for {trade.order_id}: {exc}")
+            elif payload is not None and signal_lookup is not None:
+                try:
+                    signal = signal_lookup(trade)
+                except Exception as exc:
+                    logger.debug(f"Signal lookup failed for {trade.order_id}: {exc}")
+                    signal = None
+                stale_reason = self._stale_order_reason(trade, signal)
+                if stale_reason:
+                    try:
+                        clob.cancel_order(trade.order_id)
+                        payload = {"status": "expired", "errorMsg": stale_reason}
+                        logger.info(f"Cancelled stale order {trade.order_id}: {stale_reason}")
+                    except Exception as exc:
+                        logger.debug(f"Cancel stale order failed for {trade.order_id}: {exc}")
 
             if payload is None:
                 try:
@@ -869,10 +985,17 @@ class Executor:
 
         return updated
 
-    def evaluate_signal(self, signal: Signal) -> TradePlan | None:
+    def evaluate_signal(
+        self,
+        signal: Signal,
+        *,
+        count_skips: bool = True,
+        enforce_live_limits: bool = True,
+    ) -> TradePlan | None:
         market = signal.market
         if market.liquidity < self._min_liquidity:
-            self._skipped_low_liq += 1
+            if count_skips:
+                self._skipped_low_liq += 1
             return None
 
         if signal.direction == Direction.UP:
@@ -887,33 +1010,27 @@ class Executor:
         if token_price <= 0.01 or token_price >= 0.99:
             return None
 
-        clob_bid = 0.0
-        if not self._dry_run:
-            try:
-                clob = self._ensure_clob()
-                clob_bid = clob.get_best_bid(token_id)
-            except Exception as exc:
-                logger.debug(f"CLOB orderbook fetch failed, using Gamma: {exc}")
-
-        if clob_bid > 0:
-            q = clob_bid
-            reference_bid = clob_bid
-        elif signal.direction == Direction.UP:
-            q = market.best_bid if market.best_bid > 0 else token_price - self._maker_offset
-            reference_bid = market.best_bid if market.best_bid > 0 else q
+        quote = self._resolve_token_quote(token_id, token_price)
+        tick_size = max(quote.tick_size, 0.001)
+        best_bid = quote.best_bid
+        best_ask = quote.best_ask
+        if best_bid > 0:
+            q = best_bid
+            reference_bid = best_bid
         else:
-            q = max(0.01, token_price - self._maker_offset)
+            q = token_price - self._maker_offset_ticks * tick_size
             reference_bid = q
 
-        q = round(max(0.01, min(0.99, q)), 2)
-        queue_ticks = max(0.0, (reference_bid - q) / 0.01)
-        spread = market.spread if market.spread > 0 else max(0.01, market.best_ask - market.best_bid)
+        q = self._round_price_to_tick(q, tick_size)
+        queue_ticks = max(0.0, (reference_bid - q) / tick_size)
+        spread = quote.spread if quote.spread > 0 else max(tick_size, best_ask - best_bid)
         secs_remaining = market.secs_remaining
 
         p_raw = signal.win_prob
         p = max(0.0, p_raw - self._haircut)
         if p <= q:
-            self._skipped_no_edge += 1
+            if count_skips:
+                self._skipped_no_edge += 1
             logger.debug(
                 f"Skip {signal.asset} {signal.direction.value}: "
                 f"p={p:.3f} <= q={q:.3f} after {self._haircut:.0%} haircut"
@@ -924,10 +1041,11 @@ class Executor:
         if shares < market.order_min_size:
             return None
 
-        if not self._dry_run:
+        if not self._dry_run and enforce_live_limits:
             live_orders_today, live_notional_today = self.today_live_usage()
             if self._max_live_orders_per_day > 0 and live_orders_today >= self._max_live_orders_per_day:
-                self._skipped_live_limits += 1
+                if count_skips:
+                    self._skipped_live_limits += 1
                 logger.warning(
                     f"Skip live trade: daily order limit reached "
                     f"({live_orders_today}/{self._max_live_orders_per_day})"
@@ -937,7 +1055,8 @@ class Executor:
                 self._max_live_notional_usd_per_day > 0
                 and live_notional_today + self._bet_size > self._max_live_notional_usd_per_day + 1e-9
             ):
-                self._skipped_live_limits += 1
+                if count_skips:
+                    self._skipped_live_limits += 1
                 logger.warning(
                     f"Skip live trade: daily notional cap reached "
                     f"(${live_notional_today:.2f} + ${self._bet_size:.2f} > "
@@ -957,7 +1076,8 @@ class Executor:
         taker_fee = calc_taker_fee(shares, q, market.fee_rate)
 
         if submitted_ev < self._min_ev:
-            self._skipped_low_ev += 1
+            if count_skips:
+                self._skipped_low_ev += 1
             logger.debug(
                 f"Skip {signal.asset} {signal.direction.value}: "
                 f"submitted_EV ${submitted_ev:.2f} < ${self._min_ev:.2f} "
@@ -971,6 +1091,7 @@ class Executor:
         return TradePlan(
             signal=signal,
             market=market,
+            binance_symbol=signal.binance_symbol,
             direction=signal.direction.value,
             token_side=token_side,
             token_id=token_id,
@@ -991,6 +1112,7 @@ class Executor:
             liquidity_at_submit=market.liquidity,
             spread_at_submit=spread,
             queue_ticks_at_submit=queue_ticks,
+            tick_size_at_submit=tick_size,
         )
 
     async def execute(self, signal: Signal) -> TradeResult | None:
@@ -1028,6 +1150,7 @@ class Executor:
                     side="BUY",
                     price=plan.price,
                     size=round(plan.shares, 2),
+                    tick_size=self._format_tick_size(plan.tick_size_at_submit),
                     expiration=plan.expiration_ts,
                     post_only=True,
                 )
@@ -1059,6 +1182,7 @@ class Executor:
             signal=signal,
             market=market,
             asset=signal.asset,
+            binance_symbol=plan.binance_symbol,
             direction=plan.direction,
             token_side=plan.token_side,
             token_id=plan.token_id,
@@ -1085,6 +1209,7 @@ class Executor:
             liquidity_at_submit=plan.liquidity_at_submit,
             spread_at_submit=plan.spread_at_submit,
             queue_ticks_at_submit=plan.queue_ticks_at_submit,
+            tick_size_at_submit=plan.tick_size_at_submit,
             last_error=last_error,
             raw_status=status.value if self._dry_run else self._extract_status(raw_response),
         )

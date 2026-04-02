@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from dataclasses import dataclass
 from typing import Any
 
 import aiohttp
@@ -21,6 +22,15 @@ logger = logging.getLogger(__name__)
 
 GAMMA_BASE = "https://gamma-api.polymarket.com"
 EVENT_PAGE_BASE = "https://polymarket.com/event"
+
+
+@dataclass
+class TokenBookSnapshot:
+    token_id: str
+    best_bid: float
+    best_ask: float
+    spread: float
+    tick_size: float
 
 
 class PolymarketGammaClient:
@@ -296,6 +306,47 @@ class PolymarketCLOBClient:
         )
         return bid_depth, ask_depth
 
+    def get_tick_size(self, token_id: str) -> float:
+        client = self._ensure_client()
+        try:
+            return float(client.get_tick_size(token_id) or 0.01)
+        except (TypeError, ValueError):
+            return 0.01
+
+    def get_book_snapshot(self, token_id: str) -> TokenBookSnapshot:
+        book = self.get_orderbook(token_id)
+        bids = self._read_book_levels(book, "bids")
+        asks = self._read_book_levels(book, "asks")
+        best_bid = self._read_level_value(bids[0], "price") if bids else 0.0
+        best_ask = self._read_level_value(asks[0], "price") if asks else 0.0
+        if best_bid > 0 and best_ask > 0:
+            spread = max(0.0, best_ask - best_bid)
+        else:
+            spread = 0.0
+
+        tick_size = 0.01
+        if isinstance(book, dict):
+            try:
+                tick_size = float(book.get("tick_size", 0.01) or 0.01)
+            except (TypeError, ValueError):
+                tick_size = 0.01
+        else:
+            try:
+                tick_size = float(getattr(book, "tick_size", 0.01) or 0.01)
+            except (TypeError, ValueError):
+                tick_size = 0.01
+
+        if tick_size <= 0:
+            tick_size = self.get_tick_size(token_id)
+
+        return TokenBookSnapshot(
+            token_id=token_id,
+            best_bid=best_bid,
+            best_ask=best_ask,
+            spread=spread,
+            tick_size=tick_size if tick_size > 0 else 0.01,
+        )
+
     def get_order(self, order_id: str) -> Any:
         client = self._ensure_client()
         return client.get_order(order_id)
@@ -312,13 +363,17 @@ class PolymarketCLOBClient:
         client = self._ensure_client()
         return client.cancel(order_id)
 
+    def post_heartbeat(self, heartbeat_id: str | None = None) -> Any:
+        client = self._ensure_client()
+        return client.post_heartbeat(heartbeat_id)
+
     def place_limit_order(
         self,
         token_id: str,
         side: str,
         price: float,
         size: float,
-        tick_size: str = "0.01",
+        tick_size: str | None = None,
         neg_risk: bool = False,
         expiration: int = 0,
         post_only: bool = True,
@@ -341,7 +396,9 @@ class PolymarketCLOBClient:
             side=order_side,
             expiration=expiration if expiration > 0 else 0,
         )
-        options = {"tick_size": tick_size, "neg_risk": neg_risk}
+        options: dict[str, Any] = {"neg_risk": neg_risk}
+        if tick_size:
+            options["tick_size"] = tick_size
 
         order_type = OrderType.GTD if expiration > 0 else OrderType.GTC
 
@@ -354,7 +411,7 @@ class PolymarketCLOBClient:
         side: str,
         amount: float,
         worst_price: float = 0,
-        tick_size: str = "0.01",
+        tick_size: str | None = None,
         neg_risk: bool = False,
     ) -> dict:
         """Place a FOK market order (fill entirely or cancel)."""
@@ -364,11 +421,15 @@ class PolymarketCLOBClient:
 
         order_side = BUY if side.upper() == "BUY" else SELL
 
+        options: dict[str, Any] = {"neg_risk": neg_risk}
+        if tick_size:
+            options["tick_size"] = tick_size
+
         order = client.create_market_order(
             token_id=token_id,
             amount=amount,
             side=order_side,
             price=worst_price if worst_price > 0 else None,
-            options={"tick_size": tick_size, "neg_risk": neg_risk},
+            options=options,
         )
         return client.post_order(order, order_type=OrderType.FOK)

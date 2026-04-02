@@ -183,10 +183,19 @@ class Pipeline:
     async def _reconcile_loop(self):
         while True:
             try:
-                await self.executor.reconcile_pending_orders()
+                await self.executor.reconcile_pending_orders(signal_lookup=self._signal_for_trade)
             except Exception as e:
                 logger.error(f"Reconcile error: {e}")
             await asyncio.sleep(1.0)
+
+    def _signal_for_trade(self, trade) -> Signal | None:
+        symbol = getattr(trade, "binance_symbol", "") or (trade.signal.binance_symbol if trade.signal else "")
+        if not symbol:
+            symbol = f"{trade.asset.lower()}usdt"
+        price = self.last_prices.get(symbol)
+        if price is None or price <= 0:
+            return None
+        return self.comparator.check(symbol, price, time.time())
 
     async def _redeem_loop(self):
         while True:
@@ -195,6 +204,17 @@ class Pipeline:
             except Exception as e:
                 logger.error(f"Redeem loop error: {e}")
             await asyncio.sleep(self.redeemer.poll_interval)
+
+    async def _clob_heartbeat_loop(self):
+        interval = self.config.get("risk", {}).get("clob_heartbeat_interval_sec", 5)
+        if interval <= 0:
+            return
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                await self.executor.send_heartbeat()
+            except Exception as e:
+                logger.warning(f"CLOB heartbeat failed: {e}")
 
     async def _heartbeat_loop(self):
         interval = self.config.get("alerts", {}).get("heartbeat_interval_sec", 3600)
@@ -316,11 +336,14 @@ class Pipeline:
         self.executor.bootstrap_pending_orders()
         self.executor.bootstrap_wallet_orders()
         await self.executor.reconcile_pending_orders(force=True)
+        if not dry_run:
+            await self.executor.send_heartbeat(force=True)
         self.redeemer.attach_clob(self.executor._clob)
 
         stream_task = asyncio.create_task(self.stream.run())
         reconcile_task = asyncio.create_task(self._reconcile_loop())
         redeem_task = asyncio.create_task(self._redeem_loop()) if not dry_run else None
+        clob_heartbeat_task = asyncio.create_task(self._clob_heartbeat_loop()) if not dry_run else None
         heartbeat_task = asyncio.create_task(self._heartbeat_loop())
 
         await self.alerts.send_startup(
@@ -341,6 +364,8 @@ class Pipeline:
             reconcile_task.cancel()
             if redeem_task is not None:
                 redeem_task.cancel()
+            if clob_heartbeat_task is not None:
+                clob_heartbeat_task.cancel()
             heartbeat_task.cancel()
 
     async def run_headless(self):
@@ -364,9 +389,12 @@ class Pipeline:
         self.executor.bootstrap_pending_orders()
         self.executor.bootstrap_wallet_orders()
         await self.executor.reconcile_pending_orders(force=True)
+        if not dry_run:
+            await self.executor.send_heartbeat(force=True)
         self.redeemer.attach_clob(self.executor._clob)
         reconcile_task = asyncio.create_task(self._reconcile_loop())
         redeem_task = asyncio.create_task(self._redeem_loop()) if not dry_run else None
+        clob_heartbeat_task = asyncio.create_task(self._clob_heartbeat_loop()) if not dry_run else None
         heartbeat_task = asyncio.create_task(self._heartbeat_loop())
 
         await self.alerts.send_startup(
@@ -381,6 +409,8 @@ class Pipeline:
             reconcile_task.cancel()
             if redeem_task is not None:
                 redeem_task.cancel()
+            if clob_heartbeat_task is not None:
+                clob_heartbeat_task.cancel()
             heartbeat_task.cancel()
             if self._db_conn is not None:
                 self._db_conn.close()

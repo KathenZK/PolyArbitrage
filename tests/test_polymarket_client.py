@@ -48,12 +48,18 @@ class PolymarketClientTests(unittest.TestCase):
         bid_depth, ask_depth = client.get_book_depth("token", levels=2)
         self.assertAlmostEqual(bid_depth, 10.9, places=6)
         self.assertAlmostEqual(ask_depth, 10.12, places=6)
+        snapshot = client.get_book_snapshot("token")
+        self.assertEqual(snapshot.best_bid, 0.61)
+        self.assertEqual(snapshot.best_ask, 0.63)
+        self.assertAlmostEqual(snapshot.spread, 0.02, places=6)
+        self.assertEqual(snapshot.tick_size, 0.01)
 
     def test_orderbook_helpers_support_dicts(self):
         client = PolymarketCLOBClient("test-key")
         client.get_orderbook = lambda token_id: {
             "bids": [{"price": "0.48", "size": "5"}],
             "asks": [{"price": "0.51", "size": "7"}],
+            "tick_size": "0.001",
         }
 
         self.assertEqual(client.get_best_bid("token"), 0.48)
@@ -61,6 +67,8 @@ class PolymarketClientTests(unittest.TestCase):
         bid_depth, ask_depth = client.get_book_depth("token")
         self.assertAlmostEqual(bid_depth, 2.4, places=6)
         self.assertAlmostEqual(ask_depth, 3.57, places=6)
+        snapshot = client.get_book_snapshot("token")
+        self.assertEqual(snapshot.tick_size, 0.001)
 
     def test_client_init_passes_signature_type_funder_and_api_creds(self):
         events: list[tuple[str, object]] = []
@@ -75,6 +83,10 @@ class PolymarketClientTests(unittest.TestCase):
             def create_or_derive_api_creds(self):
                 events.append(("derive", None))
                 return {"key": "derived", "secret": "derived", "passphrase": "derived"}
+
+            def post_heartbeat(self, heartbeat_id):
+                events.append(("heartbeat", heartbeat_id))
+                return {"heartbeat_id": "hb-1"}
 
         fake_client_mod = types.ModuleType("py_clob_client.client")
         fake_client_mod.ClobClient = FakeClobClient
@@ -114,6 +126,8 @@ class PolymarketClientTests(unittest.TestCase):
 
         self.assertIn(("set_api_creds", {"key": "key123", "secret": "secret123", "passphrase": "pass123"}), events)
         self.assertFalse(any(kind == "derive" for kind, _ in events))
+        self.assertEqual(client.post_heartbeat("hb-0")["heartbeat_id"], "hb-1")
+        self.assertIn(("heartbeat", "hb-0"), events)
 
 
 if __name__ == "__main__":

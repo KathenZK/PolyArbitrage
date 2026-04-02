@@ -6,7 +6,7 @@ strategy:
   min_secs_remaining: 30           # skip markets with < 30s left
   min_secs_elapsed: 30             # wait 30s after window opens before trading
   require_official_source: true    # require official Polymarket/Chainlink anchor before trading
-  official_max_age_sec: 90         # skip if official anchor is too stale
+  official_max_age_sec: 15         # skip if official anchor is too stale
   max_source_divergence_pct: 0.0025
   source_gap_penalty_mult: 8.0
 
@@ -34,11 +34,12 @@ strategy:
 
   # Market registry
   registry_refresh_sec: 15
-  official_refresh_sec: 60
+  official_refresh_sec: 5
 
 risk:
   dry_run: true
   require_live_arm: true
+  clob_heartbeat_interval_sec: 5
   max_live_orders_per_day: 4
   max_live_notional_usd_per_day: 10
 

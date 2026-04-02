@@ -8,7 +8,7 @@ from pathlib import Path
 
 from src.data.market_registry import CryptoMarket
 from src.output.db import get_connection, init_db, insert_trade
-from src.strategies.executor import Executor, OrderStatus
+from src.strategies.executor import Executor, OrderStatus, TokenQuote
 from src.strategies.momentum import Direction, Signal
 
 
@@ -19,9 +19,23 @@ class FakeCLOB:
         self.orders: dict[str, dict] = {}
         self.cancelled: list[str] = []
         self.last_order_id = 0
+        self.heartbeats: list[str | None] = []
 
     def get_best_bid(self, token_id: str) -> float:
         return 0.61
+
+    def get_book_snapshot(self, token_id: str) -> TokenQuote:
+        return TokenQuote(
+            token_id=token_id,
+            best_bid=0.61,
+            best_ask=0.63,
+            spread=0.02,
+            tick_size=0.01,
+        )
+
+    def post_heartbeat(self, heartbeat_id=None):
+        self.heartbeats.append(heartbeat_id)
+        return {"heartbeat_id": "hb-1"}
 
     def place_limit_order(self, **kwargs):
         self.last_order_id += 1
@@ -167,6 +181,35 @@ class ExecutorReconcileTests(unittest.TestCase):
 
         self.assertIsNone(trade)
         self.assertEqual(executor.skipped_live_limits, 1)
+
+    def test_stale_pending_order_is_cancelled_when_signal_disappears(self):
+        executor = Executor(dry_run=False)
+        executor.attach_db(self.conn)
+        fake_clob = FakeCLOB(final_status="live")
+        executor._clob = fake_clob
+
+        trade = asyncio.run(executor.execute(build_signal()))
+        self.assertIsNotNone(trade)
+        fake_clob.open_orders = [{"orderID": trade.order_id, "status": "live"}]
+
+        asyncio.run(executor.reconcile_pending_orders(force=True, signal_lookup=lambda _: None))
+
+        self.assertIn(trade.order_id, fake_clob.cancelled)
+        self.assertEqual(trade.status, OrderStatus.EXPIRED)
+
+    def test_live_heartbeat_is_forwarded_to_clob(self):
+        executor = Executor(dry_run=False)
+        executor.attach_db(self.conn)
+        fake_clob = FakeCLOB(final_status="live")
+        executor._clob = fake_clob
+
+        trade = asyncio.run(executor.execute(build_signal()))
+        self.assertIsNotNone(trade)
+
+        sent = asyncio.run(executor.send_heartbeat(force=True))
+
+        self.assertTrue(sent)
+        self.assertEqual(fake_clob.heartbeats, [None])
 
 
 if __name__ == "__main__":
