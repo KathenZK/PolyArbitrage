@@ -15,7 +15,7 @@ strategy:
   signal_cooldown_sec: 120
 
   # Execution: submit only if fill-adjusted EV = fill_prob × B × (p_adj / q - 1) >= min_ev_usd
-  bet_size_usd: 15
+  bet_size_usd: 2
   min_liquidity: 1000
   min_ev_usd: 0.10                 # minimum real EV in USD to place a trade
   adverse_selection_haircut: 0.05  # subtract 5% from p to account for adverse selection
@@ -34,8 +34,8 @@ strategy:
 risk:
   dry_run: true
   require_live_arm: true
-  max_live_orders_per_day: 6
-  max_live_notional_usd_per_day: 25
+  max_live_orders_per_day: 4
+  max_live_notional_usd_per_day: 10
 
 alerts:
   dingtalk_webhook: ""             # set via DINGTALK_WEBHOOK env var
