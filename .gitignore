@@ -7,6 +7,10 @@ build/
 .env
 data/*.db
 data/*.json
+data/recordings/*.pid
+data/recordings/*.jsonl
+data/recordings/*_replay_summary.json
+!data/recordings/test_*.jsonl
 *.log
 .DS_Store
 *.pem
