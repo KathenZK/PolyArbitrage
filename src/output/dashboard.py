@@ -99,7 +99,7 @@ def build_trades_table(pipeline: Pipeline) -> Table:
             Text(t.token_side, style=f"bold {style}"),
             Text(t.display_status, style=status_style),
             f"{t.matched_ratio:.0%}",
-            f"{t.fill_prob:.0%}",
+            f"{t.fill_ratio_lower_bound:.0%}",
             f"{t.price:.2f}",
             f"{t.win_prob:.0%}",
             Text(f"${t.submitted_ev:.2f}", style=ev_style),
@@ -189,7 +189,7 @@ def build_ev_panel(pipeline: Pipeline) -> Panel:
     total_fee_saved = sum(t.taker_fee_avoided * t.matched_ratio for t in filled)
     matched_weight = sum(t.matched_ratio for t in filled)
     avg_p = sum(t.win_prob * t.matched_ratio for t in filled) / matched_weight if matched_weight > 0 else 0
-    avg_fill_prob = sum(t.fill_prob for t in trades) / len(trades) if trades else 0
+    avg_fill_prob = sum(t.fill_ratio_lower_bound for t in trades) / len(trades) if trades else 0
 
     text = Text()
     text.append(f" Trades:     {len(trades)}\n")

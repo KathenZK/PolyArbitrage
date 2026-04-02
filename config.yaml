@@ -23,6 +23,10 @@ strategy:
   fill_rate_prior: 0.35            # prior maker fill ratio before enough live samples exist
   fill_min_samples: 20             # minimum resolved live orders before using empirical fill stats
   fill_lookback_hours: 168         # empirical fill window
+  fill_decay_half_life_hours: 24   # older fills decay exponentially
+  fill_prior_strength: 12          # pseudo-sample count for the heuristic prior
+  fill_confidence_scale: 8         # higher = slower confidence growth
+  fill_lower_bound_z: 1.0          # use mean - z * stderr as conservative fill ratio
 
   # Market registry
   registry_refresh_sec: 15

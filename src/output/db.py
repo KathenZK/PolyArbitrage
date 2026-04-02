@@ -19,10 +19,18 @@ TRADE_COLUMNS: dict[str, str] = {
     "matched_cost_usd": "REAL NOT NULL DEFAULT 0",
     "win_prob": "REAL NOT NULL DEFAULT 0",
     "fill_prob": "REAL NOT NULL DEFAULT 0",
+    "fill_lower_bound": "REAL NOT NULL DEFAULT 0",
+    "fill_confidence": "REAL NOT NULL DEFAULT 0",
+    "fill_effective_samples": "REAL NOT NULL DEFAULT 0",
+    "fill_source": "TEXT DEFAULT ''",
     "filled_ev_usd": "REAL NOT NULL DEFAULT 0",
     "expected_value_usd": "REAL NOT NULL DEFAULT 0",
     "taker_fee_avoided": "REAL NOT NULL DEFAULT 0",
     "expiration_ts": "INTEGER NOT NULL DEFAULT 0",
+    "secs_remaining_at_submit": "REAL NOT NULL DEFAULT 0",
+    "liquidity_at_submit": "REAL NOT NULL DEFAULT 0",
+    "spread_at_submit": "REAL NOT NULL DEFAULT 0",
+    "queue_ticks_at_submit": "REAL NOT NULL DEFAULT 0",
     "last_error": "TEXT DEFAULT ''",
     "raw_json": "TEXT DEFAULT '{}'",
 }
@@ -110,10 +118,18 @@ def insert_trade(
     order_id: str,
     win_prob: float,
     fill_prob: float,
+    fill_lower_bound: float,
+    fill_confidence: float,
+    fill_effective_samples: float,
+    fill_source: str,
     filled_ev_usd: float,
     expected_value_usd: float,
     taker_fee_avoided: float,
     expiration_ts: int = 0,
+    secs_remaining_at_submit: float = 0.0,
+    liquidity_at_submit: float = 0.0,
+    spread_at_submit: float = 0.0,
+    queue_ticks_at_submit: float = 0.0,
     last_error: str = "",
     raw_data: Any | None = None,
 ) -> int:
@@ -124,9 +140,12 @@ def insert_trade(
             timestamp, updated_at, strategy, event_title, action, side, asset,
             market_id, market_slug, token_id, order_id, price, size,
             matched_size, cost_usd, matched_cost_usd, is_paper, status,
-            win_prob, fill_prob, filled_ev_usd, expected_value_usd,
-            taker_fee_avoided, expiration_ts, last_error, raw_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            win_prob, fill_prob, fill_lower_bound, fill_confidence,
+            fill_effective_samples, fill_source, filled_ev_usd, expected_value_usd,
+            taker_fee_avoided, expiration_ts, secs_remaining_at_submit,
+            liquidity_at_submit, spread_at_submit, queue_ticks_at_submit,
+            last_error, raw_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             now,
@@ -149,10 +168,18 @@ def insert_trade(
             status,
             win_prob,
             fill_prob,
+            fill_lower_bound,
+            fill_confidence,
+            fill_effective_samples,
+            fill_source,
             filled_ev_usd,
             expected_value_usd,
             taker_fee_avoided,
             expiration_ts,
+            secs_remaining_at_submit,
+            liquidity_at_submit,
+            spread_at_submit,
+            queue_ticks_at_submit,
             last_error,
             json.dumps(raw_data or {}),
         ),
@@ -249,3 +276,33 @@ def get_fill_rate_stats(
         "avg_fill_ratio": float(row["avg_fill_ratio"] or 0.0),
         "full_fill_rate": float(row["full_fill_rate"] or 0.0),
     }
+
+
+def get_fill_calibration_rows(
+    conn: sqlite3.Connection,
+    *,
+    lookback_hours: float = 168.0,
+) -> list[dict[str, Any]]:
+    since_ts = time.time() - lookback_hours * 3600
+    rows = conn.execute(
+        """
+        SELECT
+            timestamp,
+            asset,
+            size,
+            matched_size,
+            status,
+            secs_remaining_at_submit,
+            liquidity_at_submit,
+            spread_at_submit,
+            queue_ticks_at_submit
+        FROM trades
+        WHERE is_paper=0
+          AND status IN ('filled', 'expired', 'rejected')
+          AND timestamp >= ?
+          AND size > 0
+        ORDER BY timestamp DESC
+        """,
+        (since_ts,),
+    ).fetchall()
+    return [dict(row) for row in rows]

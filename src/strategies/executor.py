@@ -19,10 +19,11 @@ import os
 import time
 from dataclasses import dataclass
 from enum import Enum
+from math import exp, sqrt
 from typing import Any
 
 from src.data.market_registry import CryptoMarket
-from src.output.db import get_fill_rate_stats, get_pending_trades, insert_trade, update_trade
+from src.output.db import get_fill_calibration_rows, get_pending_trades, insert_trade, update_trade
 from src.strategies.momentum import Direction, Signal
 
 logger = logging.getLogger(__name__)
@@ -57,11 +58,19 @@ class TradeResult:
     timestamp: float
     status: OrderStatus = OrderStatus.PENDING
     win_prob: float = 0.0
-    fill_prob: float = 0.0
+    expected_fill_ratio: float = 0.0
+    fill_ratio_lower_bound: float = 0.0
+    fill_confidence: float = 0.0
+    fill_effective_samples: float = 0.0
+    fill_source: str = ""
     filled_ev: float = 0.0
     submitted_ev: float = 0.0
     taker_fee_avoided: float = 0.0
     expiration_ts: int = 0
+    secs_remaining_at_submit: float = 0.0
+    liquidity_at_submit: float = 0.0
+    spread_at_submit: float = 0.0
+    queue_ticks_at_submit: float = 0.0
     db_id: int | None = None
     last_error: str = ""
     raw_status: str = ""
@@ -84,6 +93,19 @@ class TradeResult:
             return "partial"
         return self.status.value
 
+    @property
+    def fill_prob(self) -> float:
+        return self.expected_fill_ratio
+
+
+@dataclass
+class FillEstimate:
+    expected_fill_ratio: float
+    conservative_fill_ratio: float
+    confidence: float
+    effective_samples: float
+    source: str
+
 
 @dataclass
 class TradePlan:
@@ -96,11 +118,23 @@ class TradePlan:
     shares: float
     cost_usd: float
     win_prob: float
-    fill_prob: float
+    expected_fill_ratio: float
+    fill_ratio_lower_bound: float
+    fill_confidence: float
+    fill_effective_samples: float
+    fill_source: str
     filled_ev: float
     submitted_ev: float
     taker_fee_avoided: float
     expiration_ts: int
+    secs_remaining_at_submit: float
+    liquidity_at_submit: float
+    spread_at_submit: float
+    queue_ticks_at_submit: float
+
+    @property
+    def fill_prob(self) -> float:
+        return self.expected_fill_ratio
 
 
 class Executor:
@@ -123,6 +157,10 @@ class Executor:
         fill_rate_prior: float = 0.35,
         fill_min_samples: int = 20,
         fill_lookback_hours: float = 168.0,
+        fill_decay_half_life_hours: float = 24.0,
+        fill_prior_strength: float = 12.0,
+        fill_confidence_scale: float = 8.0,
+        fill_lower_bound_z: float = 1.0,
     ):
         self._bet_size = bet_size_usd
         self._dry_run = dry_run
@@ -134,6 +172,10 @@ class Executor:
         self._fill_rate_prior = fill_rate_prior
         self._fill_min_samples = fill_min_samples
         self._fill_lookback_hours = fill_lookback_hours
+        self._fill_decay_half_life_hours = fill_decay_half_life_hours
+        self._fill_prior_strength = fill_prior_strength
+        self._fill_confidence_scale = fill_confidence_scale
+        self._fill_lower_bound_z = fill_lower_bound_z
         self._clob = None
         self._db = None
         self._orders: list[TradeResult] = []
@@ -141,7 +183,7 @@ class Executor:
         self._skipped_low_ev = 0
         self._skipped_no_edge = 0
         self._last_reconcile = 0.0
-        self._fill_stats_cache: dict[str, tuple[float, float]] = {}
+        self._fill_stats_cache: dict[tuple[str, str, str, str, str], tuple[float, FillEstimate]] = {}
 
     @property
     def trade_count(self) -> int:
@@ -222,60 +264,174 @@ class Executor:
     def _clamp(value: float, low: float, high: float) -> float:
         return max(low, min(high, value))
 
-    def _empirical_fill_ratio(self, asset: str) -> float:
-        cache_key = asset.upper()
-        cached = self._fill_stats_cache.get(cache_key)
-        now = time.time()
-        if cached and now - cached[0] < 60:
-            return cached[1]
+    @staticmethod
+    def _time_bucket(secs_remaining: float) -> str:
+        if secs_remaining < 120:
+            return "short"
+        if secs_remaining < 360:
+            return "mid"
+        return "long"
 
+    @staticmethod
+    def _spread_bucket(spread: float) -> str:
+        ticks = round(max(spread, 0.01) / 0.01)
+        if ticks <= 1:
+            return "tight"
+        if ticks <= 2:
+            return "medium"
+        return "wide"
+
+    def _liquidity_bucket(self, liquidity: float) -> str:
+        if liquidity < self._min_liquidity * 2:
+            return "low"
+        if liquidity < self._min_liquidity * 5:
+            return "mid"
+        return "high"
+
+    @staticmethod
+    def _queue_bucket(queue_ticks: float) -> str:
+        if queue_ticks <= 0.01:
+            return "top"
+        if queue_ticks <= 1.0:
+            return "near"
+        return "deep"
+
+    @staticmethod
+    def _effective_sample_size(weights: list[float]) -> float:
+        if not weights:
+            return 0.0
+        sum_w = sum(weights)
+        sum_w_sq = sum(weight * weight for weight in weights)
+        if sum_w_sq <= 0:
+            return 0.0
+        return (sum_w * sum_w) / sum_w_sq
+
+    def _heuristic_fill_ratio(
+        self,
+        *,
+        market: CryptoMarket,
+        quote_price: float,
+        queue_ticks: float,
+        spread: float,
+    ) -> float:
         fill_ratio = self._fill_rate_prior
-        if self._db is not None:
-            asset_stats = get_fill_rate_stats(
-                self._db,
-                asset=cache_key,
-                lookback_hours=self._fill_lookback_hours,
-            )
-            if asset_stats["samples"] >= self._fill_min_samples:
-                fill_ratio = asset_stats["avg_fill_ratio"]
-            else:
-                global_stats = get_fill_rate_stats(
-                    self._db,
-                    lookback_hours=self._fill_lookback_hours,
-                )
-                if global_stats["samples"] >= self._fill_min_samples:
-                    fill_ratio = global_stats["avg_fill_ratio"]
+        queue_factor = 1.0 / (1.0 + queue_ticks)
+        spread_factor = self._clamp(spread / 0.03, 0.5, 1.25)
+        time_factor = self._clamp(market.secs_remaining / 300.0, 0.25, 1.0)
+        liquidity_factor = self._clamp(market.liquidity / max(self._min_liquidity, 1.0), 0.5, 1.5)
 
-        fill_ratio = self._clamp(fill_ratio, 0.05, 0.95)
-        self._fill_stats_cache[cache_key] = (now, fill_ratio)
-        return fill_ratio
+        fill_ratio *= 0.7 + 0.3 * queue_factor
+        fill_ratio *= 0.85 + 0.15 * min(1.0, spread_factor)
+        fill_ratio *= 0.6 + 0.4 * time_factor
+        fill_ratio *= 0.75 + 0.25 * min(1.0, liquidity_factor)
+        return self._clamp(fill_ratio, 0.02, 0.98)
 
-    def _estimate_fill_probability(
+    def _estimate_fill_ratio(
         self,
         *,
         asset: str,
         market: CryptoMarket,
         quote_price: float,
-    ) -> float:
-        prior = self._empirical_fill_ratio(asset)
+        queue_ticks: float,
+        spread: float,
+    ) -> FillEstimate:
+        asset_key = asset.upper()
+        time_bucket = self._time_bucket(market.secs_remaining)
+        spread_bucket = self._spread_bucket(spread)
+        liquidity_bucket = self._liquidity_bucket(market.liquidity)
+        queue_bucket = self._queue_bucket(queue_ticks)
+        cache_key = (asset_key, time_bucket, spread_bucket, liquidity_bucket, queue_bucket)
 
-        best_bid = market.best_bid if market.best_bid > 0 else quote_price
-        best_ask = market.best_ask if market.best_ask > 0 else max(quote_price + 0.01, best_bid + 0.01)
-        spread = max(0.01, best_ask - best_bid)
-        ticks_behind_top = max(0.0, (best_bid - quote_price) / 0.01)
+        now = time.time()
+        cached = self._fill_stats_cache.get(cache_key)
+        if cached and now - cached[0] < 60:
+            return cached[1]
 
-        queue_factor = 1.0 / (1.0 + ticks_behind_top)
-        spread_factor = self._clamp(spread / 0.03, 0.5, 1.25)
-        time_factor = self._clamp(market.secs_remaining / 300.0, 0.25, 1.0)
-        liquidity_factor = self._clamp(market.liquidity / max(self._min_liquidity, 1.0), 0.5, 1.5)
+        prior_mean = self._heuristic_fill_ratio(
+            market=market,
+            quote_price=quote_price,
+            queue_ticks=queue_ticks,
+            spread=spread,
+        )
+        prior_strength = self._fill_prior_strength
+        prior_var = max(0.01, prior_mean * (1 - prior_mean) * 0.5)
 
-        fill_prob = prior
-        fill_prob *= 0.7 + 0.3 * queue_factor
-        fill_prob *= 0.85 + 0.15 * min(1.0, spread_factor)
-        fill_prob *= 0.6 + 0.4 * time_factor
-        fill_prob *= 0.75 + 0.25 * min(1.0, liquidity_factor)
+        weighted_ratios: list[tuple[float, float]] = []
+        source = "heuristic"
 
-        return self._clamp(fill_prob, 0.02, 0.98)
+        if self._db is not None:
+            rows = get_fill_calibration_rows(
+                self._db,
+                lookback_hours=self._fill_lookback_hours,
+            )
+            decay_base = 0.6931471805599453 / max(self._fill_decay_half_life_hours, 1e-9)
+            for row in rows:
+                row_size = float(row.get("size", 0) or 0)
+                if row_size <= 0:
+                    continue
+
+                fill_ratio = self._clamp(float(row.get("matched_size", 0) or 0) / row_size, 0.0, 1.0)
+                age_hours = max(0.0, (now - float(row.get("timestamp", now) or now)) / 3600.0)
+                age_weight = exp(-decay_base * age_hours)
+
+                row_asset = str(row.get("asset", "") or "").upper()
+                asset_weight = 1.0 if row_asset == asset_key else 0.15
+
+                row_time_bucket = self._time_bucket(float(row.get("secs_remaining_at_submit", 0) or 0))
+                row_spread_bucket = self._spread_bucket(float(row.get("spread_at_submit", 0.01) or 0.01))
+                row_liquidity_bucket = self._liquidity_bucket(float(row.get("liquidity_at_submit", 0) or 0))
+                row_queue_bucket = self._queue_bucket(float(row.get("queue_ticks_at_submit", 0) or 0))
+
+                time_weight = 1.0 if row_time_bucket == time_bucket else 0.55
+                spread_weight = 1.0 if row_spread_bucket == spread_bucket else 0.75
+                liquidity_weight = 1.0 if row_liquidity_bucket == liquidity_bucket else 0.75
+                queue_weight = 1.0 if row_queue_bucket == queue_bucket else 0.6
+
+                weight = age_weight * asset_weight * time_weight * spread_weight * liquidity_weight * queue_weight
+                if weight < 0.01:
+                    continue
+                weighted_ratios.append((weight, fill_ratio))
+
+            if weighted_ratios:
+                source = "decayed_history"
+
+        sample_weight_sum = sum(weight for weight, _ in weighted_ratios)
+        sample_weight_sq_sum = sum(weight * weight for weight, _ in weighted_ratios)
+        posterior_mean = prior_mean
+        variance = prior_var
+        effective_samples = prior_strength
+
+        if sample_weight_sum > 0:
+            sample_mean = sum(weight * ratio for weight, ratio in weighted_ratios) / sample_weight_sum
+            posterior_mean = (
+                prior_strength * prior_mean + sample_weight_sum * sample_mean
+            ) / (prior_strength + sample_weight_sum)
+
+            sample_var = sum(weight * ((ratio - sample_mean) ** 2) for weight, ratio in weighted_ratios) / sample_weight_sum
+            variance = (
+                prior_strength * prior_var + sample_weight_sum * sample_var
+            ) / (prior_strength + sample_weight_sum)
+            effective_samples = prior_strength + (
+                (sample_weight_sum * sample_weight_sum) / sample_weight_sq_sum if sample_weight_sq_sum > 0 else 0.0
+            )
+
+        confidence = self._clamp(
+            effective_samples / (effective_samples + self._fill_confidence_scale),
+            0.0,
+            1.0,
+        )
+        stderr = sqrt(max(variance, 1e-6) / max(effective_samples, 1.0))
+        conservative = posterior_mean - self._fill_lower_bound_z * stderr - (1 - confidence) * 0.05
+        conservative = self._clamp(conservative, 0.02, posterior_mean)
+        estimate = FillEstimate(
+            expected_fill_ratio=self._clamp(posterior_mean, 0.02, 0.98),
+            conservative_fill_ratio=conservative,
+            confidence=confidence,
+            effective_samples=effective_samples,
+            source=source,
+        )
+        self._fill_stats_cache[cache_key] = (now, estimate)
+        return estimate
 
     def _normalize_status(self, raw_status: str, expiration_ts: int = 0) -> OrderStatus | None:
         if raw_status in self._FILLED_STATUSES:
@@ -349,11 +505,19 @@ class Executor:
                 status=trade.status.value,
                 order_id=trade.order_id,
                 win_prob=trade.win_prob,
-                fill_prob=trade.fill_prob,
+                fill_prob=trade.expected_fill_ratio,
+                fill_lower_bound=trade.fill_ratio_lower_bound,
+                fill_confidence=trade.fill_confidence,
+                fill_effective_samples=trade.fill_effective_samples,
+                fill_source=trade.fill_source,
                 filled_ev_usd=trade.filled_ev,
                 expected_value_usd=trade.submitted_ev,
                 taker_fee_avoided=trade.taker_fee_avoided,
                 expiration_ts=trade.expiration_ts,
+                secs_remaining_at_submit=trade.secs_remaining_at_submit,
+                liquidity_at_submit=trade.liquidity_at_submit,
+                spread_at_submit=trade.spread_at_submit,
+                queue_ticks_at_submit=trade.queue_ticks_at_submit,
                 last_error=trade.last_error,
                 raw_data=raw_data,
             )
@@ -402,11 +566,19 @@ class Executor:
                 timestamp=float(row.get("timestamp", 0) or 0),
                 status=status,
                 win_prob=float(row.get("win_prob", 0) or 0),
-                fill_prob=float(row.get("fill_prob", 0) or 0),
+                expected_fill_ratio=float(row.get("fill_prob", 0) or 0),
+                fill_ratio_lower_bound=float(row.get("fill_lower_bound", row.get("fill_prob", 0)) or 0),
+                fill_confidence=float(row.get("fill_confidence", 0) or 0),
+                fill_effective_samples=float(row.get("fill_effective_samples", 0) or 0),
+                fill_source=str(row.get("fill_source", "") or ""),
                 filled_ev=float(row.get("filled_ev_usd", row.get("expected_value_usd", 0)) or 0),
                 submitted_ev=float(row.get("expected_value_usd", 0) or 0),
                 taker_fee_avoided=float(row.get("taker_fee_avoided", 0) or 0),
                 expiration_ts=int(row.get("expiration_ts", 0) or 0),
+                secs_remaining_at_submit=float(row.get("secs_remaining_at_submit", 0) or 0),
+                liquidity_at_submit=float(row.get("liquidity_at_submit", 0) or 0),
+                spread_at_submit=float(row.get("spread_at_submit", 0) or 0),
+                queue_ticks_at_submit=float(row.get("queue_ticks_at_submit", 0) or 0),
                 db_id=int(row.get("id", 0) or 0),
                 last_error=str(row.get("last_error", "") or ""),
                 raw_status=status.value,
@@ -520,13 +692,19 @@ class Executor:
 
         if clob_bid > 0:
             q = clob_bid
+            reference_bid = clob_bid
         elif signal.direction == Direction.UP:
             q = market.best_bid if market.best_bid > 0 else token_price - self._maker_offset
+            reference_bid = market.best_bid if market.best_bid > 0 else q
         else:
             down_best_bid = (1 - market.best_ask) if market.best_ask > 0 else token_price - self._maker_offset
             q = max(0.01, down_best_bid)
+            reference_bid = down_best_bid
 
         q = round(max(0.01, min(0.99, q)), 2)
+        queue_ticks = max(0.0, (reference_bid - q) / 0.01)
+        spread = market.spread if market.spread > 0 else max(0.01, market.best_ask - market.best_bid)
+        secs_remaining = market.secs_remaining
 
         p_raw = signal.win_prob
         p = max(0.0, p_raw - self._haircut)
@@ -543,12 +721,14 @@ class Executor:
             return None
 
         filled_ev = self._bet_size * (p / q - 1)
-        fill_prob = self._estimate_fill_probability(
+        fill_estimate = self._estimate_fill_ratio(
             asset=signal.asset,
             market=market,
             quote_price=q,
+            queue_ticks=queue_ticks,
+            spread=spread,
         )
-        submitted_ev = filled_ev * fill_prob
+        submitted_ev = filled_ev * fill_estimate.conservative_fill_ratio
         taker_fee = calc_taker_fee(shares, q, market.fee_rate)
 
         if submitted_ev < self._min_ev:
@@ -556,7 +736,9 @@ class Executor:
             logger.debug(
                 f"Skip {signal.asset} {signal.direction.value}: "
                 f"submitted_EV ${submitted_ev:.2f} < ${self._min_ev:.2f} "
-                f"(filled_EV=${filled_ev:.2f}, fill={fill_prob:.1%}, p={p:.3f}, q={q:.2f})"
+                f"(filled_EV=${filled_ev:.2f}, "
+                f"fill~{fill_estimate.expected_fill_ratio:.1%}/lb {fill_estimate.conservative_fill_ratio:.1%}, "
+                f"p={p:.3f}, q={q:.2f})"
             )
             return None
 
@@ -571,11 +753,19 @@ class Executor:
             shares=shares,
             cost_usd=self._bet_size,
             win_prob=p,
-            fill_prob=fill_prob,
+            expected_fill_ratio=fill_estimate.expected_fill_ratio,
+            fill_ratio_lower_bound=fill_estimate.conservative_fill_ratio,
+            fill_confidence=fill_estimate.confidence,
+            fill_effective_samples=fill_estimate.effective_samples,
+            fill_source=fill_estimate.source,
             filled_ev=filled_ev,
             submitted_ev=submitted_ev,
             taker_fee_avoided=taker_fee,
             expiration_ts=expiration,
+            secs_remaining_at_submit=secs_remaining,
+            liquidity_at_submit=market.liquidity,
+            spread_at_submit=spread,
+            queue_ticks_at_submit=queue_ticks,
         )
 
     async def execute(self, signal: Signal) -> TradeResult | None:
@@ -595,7 +785,7 @@ class Executor:
             logger.info(
                 f"[PAPER] {signal.asset} {signal.direction.value} -> buy {plan.token_side} "
                 f"@ ${plan.price:.2f} x {plan.shares:.1f} = ${plan.cost_usd:.2f} | "
-                f"p_adj={plan.win_prob:.1%} fill={plan.fill_prob:.1%} "
+                f"p_adj={plan.win_prob:.1%} fill~{plan.expected_fill_ratio:.1%}/lb {plan.fill_ratio_lower_bound:.1%} "
                 f"fEV=${plan.filled_ev:.2f} sEV=${plan.submitted_ev:.2f}"
             )
         else:
@@ -625,7 +815,7 @@ class Executor:
                 logger.info(
                     f"[LIVE] {signal.asset} {signal.direction.value} -> buy {plan.token_side} "
                     f"@ ${plan.price:.2f} x {plan.shares:.1f} | "
-                    f"p={plan.win_prob:.1%} fill={plan.fill_prob:.1%} "
+                    f"p={plan.win_prob:.1%} fill~{plan.expected_fill_ratio:.1%}/lb {plan.fill_ratio_lower_bound:.1%} "
                     f"fEV=${plan.filled_ev:.2f} sEV=${plan.submitted_ev:.2f} "
                     f"order={order_id} status={raw_status or status.value}"
                 )
@@ -650,11 +840,19 @@ class Executor:
             timestamp=time.time(),
             status=status,
             win_prob=plan.win_prob,
-            fill_prob=plan.fill_prob,
+            expected_fill_ratio=plan.expected_fill_ratio,
+            fill_ratio_lower_bound=plan.fill_ratio_lower_bound,
+            fill_confidence=plan.fill_confidence,
+            fill_effective_samples=plan.fill_effective_samples,
+            fill_source=plan.fill_source,
             filled_ev=plan.filled_ev,
             submitted_ev=plan.submitted_ev,
             taker_fee_avoided=plan.taker_fee_avoided,
             expiration_ts=plan.expiration_ts,
+            secs_remaining_at_submit=plan.secs_remaining_at_submit,
+            liquidity_at_submit=plan.liquidity_at_submit,
+            spread_at_submit=plan.spread_at_submit,
+            queue_ticks_at_submit=plan.queue_ticks_at_submit,
             last_error=last_error,
             raw_status=status.value if self._dry_run else self._extract_status(raw_response),
         )

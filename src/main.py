@@ -91,6 +91,10 @@ class Pipeline:
             fill_rate_prior=strat.get("fill_rate_prior", 0.35),
             fill_min_samples=strat.get("fill_min_samples", 20),
             fill_lookback_hours=strat.get("fill_lookback_hours", 168),
+            fill_decay_half_life_hours=strat.get("fill_decay_half_life_hours", 24),
+            fill_prior_strength=strat.get("fill_prior_strength", 12),
+            fill_confidence_scale=strat.get("fill_confidence_scale", 8),
+            fill_lower_bound_z=strat.get("fill_lower_bound_z", 1.0),
         )
 
         self.registry.register_window_change_callback(self.guard.on_window_change)
