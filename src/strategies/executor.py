@@ -247,6 +247,26 @@ class Executor:
     def recent_trades(self) -> list[TradeResult]:
         return list(self._orders[-50:])
 
+    @property
+    def bet_size(self) -> float:
+        return self._bet_size
+
+    @property
+    def min_ev(self) -> float:
+        return self._min_ev
+
+    @property
+    def haircut(self) -> float:
+        return self._haircut
+
+    @property
+    def max_daily_orders(self) -> int:
+        return self._max_live_orders_per_day
+
+    @property
+    def max_daily_notional(self) -> float:
+        return self._max_live_notional_usd_per_day
+
     def attach_db(self, conn):
         self._db = conn
 
@@ -609,7 +629,7 @@ class Executor:
         self._orders = [t for t in self._orders if not (trade.order_id and t.order_id == trade.order_id)]
         self._orders.append(trade)
 
-    def _today_live_usage(self) -> tuple[int, float]:
+    def today_live_usage(self) -> tuple[int, float]:
         if self._db is not None:
             usage = get_live_daily_usage(self._db)
             return int(usage["orders"]), float(usage["submitted_notional"])
@@ -905,7 +925,7 @@ class Executor:
             return None
 
         if not self._dry_run:
-            live_orders_today, live_notional_today = self._today_live_usage()
+            live_orders_today, live_notional_today = self.today_live_usage()
             if self._max_live_orders_per_day > 0 and live_orders_today >= self._max_live_orders_per_day:
                 self._skipped_live_limits += 1
                 logger.warning(

@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import time
 from datetime import datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from rich.layout import Layout
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
+
+from src.output.db import get_fill_rate_stats, get_live_daily_usage
 
 if TYPE_CHECKING:
     from src.main import Pipeline
@@ -24,10 +26,65 @@ _STATUS_ZH = {
     "expired": "已过期",
 }
 
+_db_cache: dict[str, tuple[float, Any]] = {}
+_DB_CACHE_TTL = 5.0
+
+
+def _cached_query(key: str, conn, fn, **kwargs) -> Any:
+    now = time.time()
+    cached = _db_cache.get(key)
+    if cached and now - cached[0] < _DB_CACHE_TTL:
+        return cached[1]
+    try:
+        result = fn(conn, **kwargs)
+    except Exception:
+        return cached[1] if cached else None
+    _db_cache[key] = (now, result)
+    return result
+
 
 def _trunc(s: str, n: int = 50) -> str:
     return s[: n - 2] + ".." if len(s) > n else s
 
+
+# ---------------------------------------------------------------------------
+# Header
+# ---------------------------------------------------------------------------
+
+def build_header(pipeline: Pipeline) -> Panel:
+    strat = pipeline.config.get("strategy", {})
+    dry_run = pipeline.config.get("risk", {}).get("dry_run", True)
+
+    uptime = time.time() - pipeline.start_time if pipeline.start_time > 0 else 0
+    h, rem = divmod(int(uptime), 3600)
+    m, s = divmod(rem, 60)
+
+    symbols = "/".join(
+        sym.replace("usdt", "").upper() for sym in strat.get("symbols", [])
+    )
+    bet = strat.get("bet_size_usd", 15)
+    threshold = strat.get("edge_threshold_pct", 0.003)
+    min_ev = strat.get("min_ev_usd", 0.10)
+
+    t = Text(justify="center")
+    t.append("PolyArbitrage — 延迟套利", style="bold white")
+    t.append(" | ", style="dim")
+    t.append("模拟" if dry_run else "实盘", style="bold yellow" if dry_run else "bold red")
+    t.append(" | ", style="dim")
+    t.append(symbols, style="cyan")
+    t.append(" | ", style="dim")
+    t.append(f"${bet}/笔", style="white")
+    t.append(f" 阈值{threshold:.1%}", style="white")
+    t.append(f" EV≥${min_ev:.2f}", style="white")
+    t.append(" | ", style="dim")
+    t.append(f"{h:02d}:{m:02d}:{s:02d}", style="green")
+
+    return Panel(t, border_style="blue")
+
+
+# ---------------------------------------------------------------------------
+# Prices
+# ---------------------------------------------------------------------------
 
 def build_prices_panel(pipeline: Pipeline) -> Panel:
     text = Text()
@@ -38,12 +95,29 @@ def build_prices_panel(pipeline: Pipeline) -> Panel:
         market = pipeline.registry.get_market(symbol)
         open_str = ""
         dev_str = ""
-        if market and (market.has_official_opening_price or market.has_opening_price):
-            op = market.official_opening_price if market.has_official_opening_price else market.opening_price
-            dev = (price - op) / op
-            open_str = f"  开盘 ${op:>10,.2f}"
-            style = "green" if dev >= 0 else "red"
-            dev_str = f"  [{style}]{dev:+.2%}[/{style}]"
+        source_tag = ""
+        source_style = "dim"
+
+        if market:
+            if market.has_official_calibration and market.official_calibration_age < 90:
+                source_tag = " (官方)"
+                source_style = "green"
+            elif market.has_opening_price:
+                source_tag = " (币安)"
+                source_style = "yellow"
+            else:
+                source_tag = " (---)"
+
+            if market.has_official_opening_price or market.has_opening_price:
+                op = (
+                    market.official_opening_price
+                    if market.has_official_opening_price
+                    else market.opening_price
+                )
+                dev = (price - op) / op
+                open_str = f"  开盘${op:>10,.2f}"
+                style = "green" if dev >= 0 else "red"
+                dev_str = f" [{style}]{dev:+.2%}[/{style}]"
 
         text.append(f"  {label:<4}", style="bold cyan")
         text.append(f"${price:>10,.2f}")
@@ -51,6 +125,8 @@ def build_prices_panel(pipeline: Pipeline) -> Panel:
             text.append(open_str, style="dim")
         if dev_str:
             text.append_text(Text.from_markup(dev_str))
+        if source_tag:
+            text.append(source_tag, style=source_style)
         text.append("\n")
 
     if not pipeline.last_prices:
@@ -58,78 +134,18 @@ def build_prices_panel(pipeline: Pipeline) -> Panel:
     return Panel(text, title="价格 (币安 vs 锚定价)", border_style="cyan")
 
 
-def build_signals_table(pipeline: Pipeline) -> Table:
-    table = Table(title="信号", expand=True, border_style="yellow")
-    table.add_column("时间", width=8)
-    table.add_column("品种", width=4)
-    table.add_column("来源", width=5)
-    table.add_column("方向", width=5)
-    table.add_column("偏差", width=7, justify="right")
-    table.add_column("胜率", width=6, justify="right")
-
-    for sig in reversed(pipeline.signals[-12:]):
-        ts = datetime.fromtimestamp(sig.timestamp).strftime("%H:%M:%S")
-        is_up = sig.direction.value == "UP"
-        style = "green" if is_up else "red"
-        table.add_row(
-            ts,
-            sig.asset,
-            "双源" if sig.price_source == "dual_calibrated" else "币安",
-            Text(_DIR_ZH.get(sig.direction.value, sig.direction.value), style=f"bold {style}"),
-            Text(f"{sig.deviation_pct:+.2%}", style=style),
-            f"{sig.win_prob:.1%}",
-        )
-    if not pipeline.signals:
-        table.add_row("", "", "", Text("等待中...", style="dim"), "", "")
-    return table
-
-
-def build_trades_table(pipeline: Pipeline) -> Table:
-    table = Table(title="交易", expand=True, border_style="green")
-    table.add_column("时间", width=8)
-    table.add_column("品种", width=4)
-    table.add_column("方向", width=5)
-    table.add_column("状态", width=8)
-    table.add_column("成交", width=7, justify="right")
-    table.add_column("f*", width=5, justify="right")
-    table.add_column("q", width=5, justify="right")
-    table.add_column("p", width=5, justify="right")
-    table.add_column("EV", width=6, justify="right")
-    table.add_column("$", width=6, justify="right")
-    table.add_column("", width=6)
-
-    for t in reversed(pipeline.executor.recent_trades[-12:]):
-        ts = datetime.fromtimestamp(t.timestamp).strftime("%H:%M:%S")
-        is_up = t.direction == "UP"
-        style = "green" if is_up else "red"
-        mode = Text("模拟", style="yellow") if t.is_paper else Text("实盘", style="bold red")
-        ev_style = "green" if t.submitted_ev > 0 else "red"
-        status_zh = _STATUS_ZH.get(t.display_status, t.display_status)
-        status_style = "green" if t.display_status == "filled" else "yellow" if t.display_status in {"pending", "partial"} else "red"
-        table.add_row(
-            ts,
-            t.asset,
-            Text(_SIDE_ZH.get(t.token_side, t.token_side), style=f"bold {style}"),
-            Text(status_zh, style=status_style),
-            f"{t.matched_ratio:.0%}",
-            f"{t.fill_ratio_lower_bound:.0%}",
-            f"{t.price:.2f}",
-            f"{t.win_prob:.0%}",
-            Text(f"${t.submitted_ev:.2f}", style=ev_style),
-            f"${t.matched_cost_usd:.0f}",
-            mode,
-        )
-    if not pipeline.executor.recent_trades:
-        table.add_row("", "", "", "", "", "", "", "", "", Text("--", style="dim"), "")
-    return table
-
+# ---------------------------------------------------------------------------
+# Markets
+# ---------------------------------------------------------------------------
 
 def build_markets_table(pipeline: Pipeline) -> Table:
     table = Table(title="15分钟市场", expand=True, border_style="magenta")
     table.add_column("品种", width=4)
     table.add_column("看涨", width=6, justify="right")
     table.add_column("看跌", width=6, justify="right")
+    table.add_column("价差", width=5, justify="right")
     table.add_column("锚定价", width=11, justify="right")
+    table.add_column("源", width=3, justify="center")
     table.add_column("剩余", width=8, justify="right")
     table.add_column("流动性", width=9, justify="right")
 
@@ -141,108 +157,342 @@ def build_markets_table(pipeline: Pipeline) -> Table:
         mins, sec = divmod(int(secs), 60)
         remaining = f"{mins}分{sec:02d}秒"
         time_style = "bold red" if secs < 60 else "yellow" if secs < 180 else "dim"
-        anchor = m.official_opening_price if m.has_official_opening_price else m.opening_price
+
+        anchor = (
+            m.official_opening_price
+            if m.has_official_opening_price
+            else m.opening_price
+        )
         has_anchor = anchor > 0
         open_str = f"${anchor:,.2f}" if has_anchor else "等待中..."
         open_style = "white" if has_anchor else "dim"
+
+        spread = m.spread if m.spread > 0 else max(0.0, m.best_ask - m.best_bid)
+        if spread > 0:
+            spread_str = f"{spread:.2f}"
+            spread_style = (
+                "green" if spread <= 0.02 else "yellow" if spread <= 0.04 else "red"
+            )
+        else:
+            spread_str = "--"
+            spread_style = "dim"
+
+        if m.has_official_calibration and m.official_calibration_age < 90:
+            src = Text("官", style="green")
+        elif m.has_official_calibration:
+            src = Text("官", style="yellow")
+        elif m.has_opening_price:
+            src = Text("币", style="dim")
+        else:
+            src = Text("--", style="dim")
+
         table.add_row(
             sym,
             f"${m.up_price:.3f}",
             f"${m.down_price:.3f}",
+            Text(spread_str, style=spread_style),
             Text(open_str, style=open_style),
+            src,
             Text(remaining, style=time_style),
             f"${m.liquidity:,.0f}",
         )
     if not pipeline.registry.all_markets:
-        table.add_row("", "", "", "", Text("扫描中...", style="dim"), "")
+        table.add_row("", "", "", "", "", "", Text("扫描中...", style="dim"), "")
     return table
 
 
+# ---------------------------------------------------------------------------
+# Signals
+# ---------------------------------------------------------------------------
+
+def build_signals_table(pipeline: Pipeline) -> Table:
+    table = Table(title="信号", expand=True, border_style="yellow")
+    table.add_column("时间", width=8)
+    table.add_column("品种", width=4)
+    table.add_column("来源", width=5)
+    table.add_column("方向", width=5)
+    table.add_column("偏差", width=7, justify="right")
+    table.add_column("胜率", width=6, justify="right")
+    table.add_column("间距", width=6, justify="right")
+
+    for sig in reversed(pipeline.signals[-12:]):
+        ts = datetime.fromtimestamp(sig.timestamp).strftime("%H:%M:%S")
+        is_up = sig.direction.value == "UP"
+        style = "green" if is_up else "red"
+
+        gap = sig.source_gap_pct
+        if gap > 0:
+            gap_style = (
+                "green" if gap < 0.001 else "yellow" if gap < 0.0025 else "red"
+            )
+            gap_text = Text(f"{gap:.2%}", style=gap_style)
+        else:
+            gap_text = Text("--", style="dim")
+
+        table.add_row(
+            ts,
+            sig.asset,
+            "双源" if sig.price_source == "dual_calibrated" else "币安",
+            Text(
+                _DIR_ZH.get(sig.direction.value, sig.direction.value),
+                style=f"bold {style}",
+            ),
+            Text(f"{sig.deviation_pct:+.2%}", style=style),
+            f"{sig.win_prob:.1%}",
+            gap_text,
+        )
+    if not pipeline.signals:
+        table.add_row("", "", "", Text("等待中...", style="dim"), "", "", "")
+    return table
+
+
+# ---------------------------------------------------------------------------
+# Trades
+# ---------------------------------------------------------------------------
+
+def build_trades_table(pipeline: Pipeline) -> Table:
+    table = Table(title="交易", expand=True, border_style="green")
+    table.add_column("时间", width=8)
+    table.add_column("品种", width=4)
+    table.add_column("方向", width=5)
+    table.add_column("状态", width=10)
+    table.add_column("成交", width=7, justify="right")
+    table.add_column("f*", width=5, justify="right")
+    table.add_column("q", width=5, justify="right")
+    table.add_column("p", width=5, justify="right")
+    table.add_column("EV", width=7, justify="right")
+    table.add_column("$", width=7, justify="right")
+    table.add_column("", width=5)
+
+    now = time.time()
+    for t in reversed(pipeline.executor.recent_trades[-12:]):
+        ts = datetime.fromtimestamp(t.timestamp).strftime("%H:%M:%S")
+        is_up = t.direction == "UP"
+        dir_style = "green" if is_up else "red"
+        mode = (
+            Text("模拟", style="yellow")
+            if t.is_paper
+            else Text("实盘", style="bold red")
+        )
+
+        status_zh = _STATUS_ZH.get(t.display_status, t.display_status)
+        if t.display_status in {"pending", "partial"} and t.expiration_ts > 0:
+            ttl = max(0, t.expiration_ts - now)
+            rm, rs = divmod(int(ttl), 60)
+            status_zh = f"{status_zh} {rm}:{rs:02d}"
+        elif t.display_status in {"rejected", "expired"} and t.last_error:
+            status_zh = f"{status_zh}!"
+        status_style = (
+            "green"
+            if t.display_status == "filled"
+            else "yellow"
+            if t.display_status in {"pending", "partial"}
+            else "red"
+        )
+
+        if t.display_status == "filled" or t.matched_shares > 0:
+            ev_val = t.realized_ev
+        else:
+            ev_val = t.submitted_ev
+        ev_style = "green" if ev_val > 0 else "red"
+
+        if t.display_status in {"pending", "partial"} and t.matched_cost_usd < 0.01:
+            cost_text = Text(f"${t.cost_usd:.0f}", style="dim")
+        else:
+            cost_text = Text(f"${t.matched_cost_usd:.0f}")
+
+        table.add_row(
+            ts,
+            t.asset,
+            Text(
+                _SIDE_ZH.get(t.token_side, t.token_side),
+                style=f"bold {dir_style}",
+            ),
+            Text(status_zh, style=status_style),
+            f"{t.matched_ratio:.0%}",
+            f"{t.fill_ratio_lower_bound:.0%}",
+            f"{t.price:.2f}",
+            f"{t.win_prob:.0%}",
+            Text(f"${ev_val:.2f}", style=ev_style),
+            cost_text,
+            mode,
+        )
+    if not pipeline.executor.recent_trades:
+        table.add_row(
+            "", "", "", "", "", "", "", "", "", Text("--", style="dim"), ""
+        )
+    return table
+
+
+# ---------------------------------------------------------------------------
+# Status
+# ---------------------------------------------------------------------------
+
 def build_status_panel(pipeline: Pipeline) -> Panel:
+    ex = pipeline.executor
     uptime = time.time() - pipeline.start_time if pipeline.start_time > 0 else 0
     h, rem = divmod(int(uptime), 3600)
     m, s = divmod(rem, 60)
 
-    text = Text()
-    text.append(f" {datetime.now().strftime('%H:%M:%S')}", style="bold")
-    text.append(f"  运行 {h:02d}:{m:02d}:{s:02d}\n")
-    text.append(f" 行情数:   {pipeline.ticks_count:>10,}\n")
-    text.append(f" 信号数:   {pipeline.signals_count:>10}\n")
-    text.append(f" 已拦截:   {pipeline.guard.suppressed_count:>10}\n")
-    text.append(f" 已通过:   {pipeline.guards_passed:>10}\n")
-    text.append(f" 低流动:   {pipeline.executor.skipped_low_liq:>10}\n")
-    text.append(f" 无优势:   {pipeline.executor.skipped_no_edge:>10}\n")
-    text.append(f" 低期望:   {pipeline.executor.skipped_low_ev:>10}\n")
-    text.append(f" 超限额:   {pipeline.executor.skipped_live_limits:>10}\n")
-    text.append(f" 挂单中:   {pipeline.executor.pending_count:>10}\n")
-    text.append(f" 已成交:   {pipeline.executor.trade_count:>10}\n")
-    text.append(f" 成交额:   ${pipeline.executor.total_cost:>9,.2f}\n")
-    text.append(f" 占用额:   ${pipeline.executor.total_committed:>9,.2f}\n")
-    redeem_status = pipeline.redeemer.status()
-    text.append(" 赎回:     ", style="bold")
-    if redeem_status.armed:
-        text.append("已激活", style="green")
-    else:
-        text.append("关闭", style="yellow")
-    text.append("\n")
-    text.append(" 模式:     ", style="bold")
-    if pipeline.config.get("risk", {}).get("dry_run", True):
-        text.append("模拟", style="bold yellow")
-    else:
-        text.append("实盘", style="bold red")
+    t = Text()
+    t.append(f" {datetime.now().strftime('%H:%M:%S')}", style="bold")
+    t.append(f"  运行 {h:02d}:{m:02d}:{s:02d}\n")
+
+    t.append(f" 行情: {pipeline.ticks_count:>8,}")
+    t.append(f"  信号: {pipeline.signals_count}\n")
+    t.append(f" 通过: {pipeline.guards_passed:>8}")
+    t.append(f"  拦截: {pipeline.guard.suppressed_count}\n")
+    t.append(f" 低流动: {ex.skipped_low_liq:>6}")
+    t.append(f"  无优势: {ex.skipped_no_edge}\n")
+    t.append(f" 低期望: {ex.skipped_low_ev:>6}")
+    t.append(f"  超限额: {ex.skipped_live_limits}\n")
+    t.append(f" 挂单: {ex.pending_count:>8}")
+    t.append(f"  成交: {ex.trade_count}\n")
+    t.append(f" 成交额: ${ex.total_cost:>7,.2f}")
+    t.append(f"  占用: ${ex.total_committed:,.2f}\n")
+
+    t.append(" ─── 连接/风控 ───\n", style="dim")
 
     binance_ok = pipeline.stream.connected
     poly_ok = pipeline.registry.market_count > 0
-    text.append(f"\n 币安:     ", style="bold")
-    text.append("已连接" if binance_ok else "连接中...", style="green" if binance_ok else "red")
-    text.append(f"\n 市场:     ", style="bold")
-    text.append(
-        f"{pipeline.registry.market_count} 个活跃" if poly_ok else "扫描中...",
+    t.append(" 币安: ")
+    t.append(
+        "已连接" if binance_ok else "连接中...",
+        style="green" if binance_ok else "red",
+    )
+    t.append("  市场: ")
+    t.append(
+        f"{pipeline.registry.market_count}个" if poly_ok else "扫描中...",
         style="green" if poly_ok else "yellow",
     )
+    t.append("\n")
 
-    return Panel(text, title="状态", border_style="blue")
+    dry_run = pipeline.config.get("risk", {}).get("dry_run", True)
+    t.append(" 模式: ")
+    t.append("模拟" if dry_run else "实盘", style="bold yellow" if dry_run else "bold red")
+    redeem_status = pipeline.redeemer.status()
+    t.append("  赎回: ")
+    t.append(
+        "已激活" if redeem_status.armed else "关闭",
+        style="green" if redeem_status.armed else "yellow",
+    )
+    t.append("\n")
+
+    t.append(" ─── 今日限额 ───\n", style="dim")
+
+    daily_orders = 0
+    daily_notional = 0.0
+    if pipeline.db_conn is not None:
+        usage = _cached_query("daily_usage", pipeline.db_conn, get_live_daily_usage)
+        if usage:
+            daily_orders = int(usage["orders"])
+            daily_notional = float(usage["submitted_notional"])
+
+    max_orders = ex.max_daily_orders
+    max_notional = ex.max_daily_notional
+
+    orders_str = f"{daily_orders}/{max_orders}" if max_orders > 0 else f"{daily_orders}/∞"
+    notional_str = (
+        f"${daily_notional:.0f}/${max_notional:.0f}"
+        if max_notional > 0
+        else f"${daily_notional:.0f}/∞"
+    )
+    orders_style = (
+        "red" if max_orders > 0 and daily_orders >= max_orders else "green"
+    )
+    notional_style = (
+        "red" if max_notional > 0 and daily_notional >= max_notional else "green"
+    )
+
+    t.append(" 日单: ")
+    t.append(orders_str, style=orders_style)
+    t.append("  日额: ")
+    t.append(notional_str, style=notional_style)
+
+    return Panel(t, title="运行状态", border_style="blue")
 
 
-def build_ev_panel(pipeline: Pipeline) -> Panel:
+# ---------------------------------------------------------------------------
+# Stats
+# ---------------------------------------------------------------------------
+
+def build_stats_panel(pipeline: Pipeline) -> Panel:
     trades = pipeline.executor.recent_trades
-    filled = [t for t in trades if t.matched_shares > 0 or t.status.value == "filled"]
-    total_submitted_ev = sum(t.submitted_ev for t in trades)
-    total_matched_ev = sum(t.realized_ev for t in filled)
-    total_fee_saved = sum(t.taker_fee_avoided * t.matched_ratio for t in filled)
-    matched_weight = sum(t.matched_ratio for t in filled)
-    avg_p = sum(t.win_prob * t.matched_ratio for t in filled) / matched_weight if matched_weight > 0 else 0
-    avg_fill_prob = sum(t.fill_ratio_lower_bound for t in trades) / len(trades) if trades else 0
+    filled = [
+        tr for tr in trades if tr.matched_shares > 0 or tr.status.value == "filled"
+    ]
+    total_submitted_ev = sum(tr.submitted_ev for tr in trades)
+    total_matched_ev = sum(tr.realized_ev for tr in filled)
+    total_fee_saved = sum(tr.taker_fee_avoided * tr.matched_ratio for tr in filled)
 
-    text = Text()
-    text.append(f" 交易数:   {len(trades)}\n")
-    text.append(f" 已成交:   {len(filled)}\n")
-    text.append(" 提交EV:   ", style="bold")
-    text.append(f"${total_submitted_ev:+,.2f}\n", style="green" if total_submitted_ev >= 0 else "red")
-    text.append(" 匹配EV:   ", style="bold")
-    text.append(f"${total_matched_ev:+,.2f}\n", style="green" if total_matched_ev >= 0 else "red")
-    text.append(f" 省手续费:  ${total_fee_saved:,.2f}\n")
-    text.append(f" 平均胜率:  {avg_p:.1%}\n") if filled else None
-    text.append(f" 平均f*:   {avg_fill_prob:.1%}\n") if trades else None
+    t = Text()
 
-    return Panel(text, title="期望价值", border_style="green")
+    t.append(f" 交易: {len(trades)}")
+    t.append(f"  已成交: {len(filled)}\n")
+    t.append(" 提交EV: ")
+    t.append(
+        f"${total_submitted_ev:+,.2f}",
+        style="green" if total_submitted_ev >= 0 else "red",
+    )
+    t.append("  匹配EV: ")
+    t.append(
+        f"${total_matched_ev:+,.2f}\n",
+        style="green" if total_matched_ev >= 0 else "red",
+    )
+    t.append(f" 省手续费: ${total_fee_saved:,.2f}\n")
 
+    t.append(" ─── 成交模型 ───\n", style="dim")
+
+    matched_weight = sum(tr.matched_ratio for tr in filled)
+    avg_p = (
+        sum(tr.win_prob * tr.matched_ratio for tr in filled) / matched_weight
+        if matched_weight > 0
+        else 0
+    )
+    avg_fill = (
+        sum(tr.fill_ratio_lower_bound for tr in trades) / len(trades) if trades else 0
+    )
+    avg_conf = sum(tr.fill_confidence for tr in trades) / len(trades) if trades else 0
+    avg_samples = (
+        sum(tr.fill_effective_samples for tr in trades) / len(trades) if trades else 0
+    )
+
+    t.append(f" 平均胜率: {avg_p:.1%}" if filled else " 平均胜率: --")
+    t.append(f"  平均f*: {avg_fill:.1%}\n" if trades else "  平均f*: --\n")
+
+    if trades:
+        t.append(f" 置信度: {avg_conf:.1%}")
+        t.append(f"  有效样本: {avg_samples:.0f}\n")
+    else:
+        t.append(" 置信度: --  有效样本: --\n")
+
+    fill_stats = None
+    if pipeline.db_conn is not None:
+        fill_stats = _cached_query("fill_stats", pipeline.db_conn, get_fill_rate_stats)
+
+    if fill_stats and fill_stats["samples"] > 0:
+        t.append(f" 历史成交率: {fill_stats['avg_fill_ratio']:.0%}")
+        t.append(f" ({fill_stats['samples']}样本/7天)\n", style="dim")
+    else:
+        t.append(" 历史成交率: -- (无数据)\n", style="dim")
+
+    return Panel(t, title="统计", border_style="green")
+
+
+# ---------------------------------------------------------------------------
+# Dashboard layout
+# ---------------------------------------------------------------------------
 
 def build_dashboard(pipeline: Pipeline) -> Layout:
     layout = Layout()
     layout.split_column(
         Layout(name="header", size=3),
-        Layout(name="top", size=12),
+        Layout(name="top", size=10),
         Layout(name="middle"),
-        Layout(name="bottom", size=14),
+        Layout(name="bottom", size=16),
     )
 
-    layout["header"].update(
-        Panel(
-            Text("PolyArbitrage — 延迟套利", style="bold white on blue", justify="center"),
-            border_style="blue",
-        )
-    )
+    layout["header"].update(build_header(pipeline))
 
     layout["top"].split_row(
         Layout(name="prices", ratio=2),
@@ -260,7 +510,7 @@ def build_dashboard(pipeline: Pipeline) -> Layout:
 
     layout["bottom"].split_row(
         Layout(build_status_panel(pipeline), ratio=1),
-        Layout(build_ev_panel(pipeline), ratio=1),
+        Layout(build_stats_panel(pipeline), ratio=1),
     )
 
     return layout

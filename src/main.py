@@ -132,6 +132,10 @@ class Pipeline:
         self.start_time = 0.0
         self._db_conn = None
 
+    @property
+    def db_conn(self):
+        return self._db_conn
+
     async def _on_tick(self, tick: Tick):
         self.ticks_count += 1
         self.last_prices[tick.symbol] = tick.price
