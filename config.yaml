@@ -33,6 +33,9 @@ strategy:
 
 risk:
   dry_run: true
+  require_live_arm: true
+  max_live_orders_per_day: 6
+  max_live_notional_usd_per_day: 25
 
 alerts:
   dingtalk_webhook: ""             # set via DINGTALK_WEBHOOK env var

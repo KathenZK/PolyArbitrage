@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 
 from src.data.market_registry import CryptoMarket
-from src.output.db import get_connection, init_db
+from src.output.db import get_connection, init_db, insert_trade
 from src.strategies.executor import Executor, OrderStatus
 from src.strategies.momentum import Direction, Signal
 
@@ -127,6 +127,45 @@ class ExecutorReconcileTests(unittest.TestCase):
         self.assertEqual(restored_trade.status, OrderStatus.FILLED)
         row = self.conn.execute("SELECT status FROM trades WHERE order_id=?", (trade.order_id,)).fetchone()
         self.assertEqual(row["status"], "filled")
+
+    def test_live_order_limit_blocks_new_trade(self):
+        insert_trade(
+            self.conn,
+            strategy="latency_arb",
+            event_title="seed",
+            action="UP",
+            side="Up",
+            asset="BTC",
+            market_id="seed-market",
+            market_slug="seed-market",
+            token_id="seed-token",
+            price=0.61,
+            size=24.59,
+            matched_size=0.0,
+            cost_usd=15.0,
+            matched_cost_usd=0.0,
+            is_paper=False,
+            status="pending",
+            order_id="seed-order",
+            win_prob=0.8,
+            fill_prob=0.3,
+            fill_lower_bound=0.2,
+            fill_confidence=0.1,
+            fill_effective_samples=1.0,
+            fill_source="seed",
+            filled_ev_usd=0.5,
+            expected_value_usd=0.1,
+            taker_fee_avoided=0.0,
+        )
+
+        executor = Executor(dry_run=False, max_live_orders_per_day=1)
+        executor.attach_db(self.conn)
+        executor._clob = FakeCLOB(final_status="matched")
+
+        trade = asyncio.run(executor.execute(build_signal()))
+
+        self.assertIsNone(trade)
+        self.assertEqual(executor.skipped_live_limits, 1)
 
 
 if __name__ == "__main__":

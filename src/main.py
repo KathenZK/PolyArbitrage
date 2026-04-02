@@ -95,6 +95,8 @@ class Pipeline:
             fill_prior_strength=strat.get("fill_prior_strength", 12),
             fill_confidence_scale=strat.get("fill_confidence_scale", 8),
             fill_lower_bound_z=strat.get("fill_lower_bound_z", 1.0),
+            max_live_orders_per_day=config.get("risk", {}).get("max_live_orders_per_day", 0),
+            max_live_notional_usd_per_day=config.get("risk", {}).get("max_live_notional_usd_per_day", 0.0),
         )
 
         self.registry.register_window_change_callback(self.guard.on_window_change)
@@ -187,6 +189,7 @@ class Pipeline:
 
     async def run(self):
         dry_run = self.config.get("risk", {}).get("dry_run", True)
+        require_live_arm = self.config.get("risk", {}).get("require_live_arm", True)
         symbols = self.config.get("strategy", {}).get("symbols", ["btcusdt"])
         self.start_time = time.time()
 
@@ -196,6 +199,10 @@ class Pipeline:
         console.print(f"  Bet:     ${self.config.get('strategy', {}).get('bet_size_usd', 15)}/trade")
 
         if not dry_run:
+            if require_live_arm and os.getenv("LIVE_TRADING_ARMED", "").strip().upper() != "YES":
+                console.print("[bold red]LIVE trading arm switch not set[/bold red]")
+                console.print("Set `LIVE_TRADING_ARMED=YES` in `.env` before disabling `dry_run`.")
+                return
             geo_ok = await self._check_geoblock()
             if not geo_ok:
                 return
@@ -235,6 +242,13 @@ class Pipeline:
 
     async def run_headless(self):
         self.start_time = time.time()
+        if (
+            not self.config.get("risk", {}).get("dry_run", True)
+            and self.config.get("risk", {}).get("require_live_arm", True)
+            and os.getenv("LIVE_TRADING_ARMED", "").strip().upper() != "YES"
+        ):
+            logger.error("LIVE_TRADING_ARMED=YES is required before disabling dry_run")
+            return
         logger.info("Pipeline started (headless)")
 
         self._db_conn = get_connection()

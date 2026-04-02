@@ -158,6 +158,7 @@ def build_status_panel(pipeline: Pipeline) -> Panel:
     text.append(f" SkipLiq:  {pipeline.executor.skipped_low_liq:>10}\n")
     text.append(f" SkipEdge: {pipeline.executor.skipped_no_edge:>10}\n")
     text.append(f" SkipEV:   {pipeline.executor.skipped_low_ev:>10}\n")
+    text.append(f" SkipLive: {pipeline.executor.skipped_live_limits:>10}\n")
     text.append(f" Pending:  {pipeline.executor.pending_count:>10}\n")
     text.append(f" Filled:   {pipeline.executor.trade_count:>10}\n")
     text.append(f" Filled$:  ${pipeline.executor.total_cost:>9,.2f}\n")

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -306,3 +307,27 @@ def get_fill_calibration_rows(
         (since_ts,),
     ).fetchall()
     return [dict(row) for row in rows]
+
+
+def get_live_daily_usage(conn: sqlite3.Connection, *, now_ts: float | None = None) -> dict[str, float]:
+    now = datetime.fromtimestamp(now_ts or time.time()).astimezone()
+    start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+    row = conn.execute(
+        """
+        SELECT
+            COUNT(*) AS orders,
+            COALESCE(SUM(cost_usd), 0) AS submitted_notional,
+            COALESCE(SUM(matched_cost_usd), 0) AS matched_notional
+        FROM trades
+        WHERE is_paper=0
+          AND timestamp >= ?
+        """,
+        (start_of_day,),
+    ).fetchone()
+    if row is None:
+        return {"orders": 0.0, "submitted_notional": 0.0, "matched_notional": 0.0}
+    return {
+        "orders": float(row["orders"] or 0),
+        "submitted_notional": float(row["submitted_notional"] or 0),
+        "matched_notional": float(row["matched_notional"] or 0),
+    }

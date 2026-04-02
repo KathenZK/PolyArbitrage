@@ -23,7 +23,13 @@ from math import exp, sqrt
 from typing import Any
 
 from src.data.market_registry import CryptoMarket
-from src.output.db import get_fill_calibration_rows, get_pending_trades, insert_trade, update_trade
+from src.output.db import (
+    get_fill_calibration_rows,
+    get_live_daily_usage,
+    get_pending_trades,
+    insert_trade,
+    update_trade,
+)
 from src.strategies.momentum import Direction, Signal
 
 logger = logging.getLogger(__name__)
@@ -161,6 +167,8 @@ class Executor:
         fill_prior_strength: float = 12.0,
         fill_confidence_scale: float = 8.0,
         fill_lower_bound_z: float = 1.0,
+        max_live_orders_per_day: int = 0,
+        max_live_notional_usd_per_day: float = 0.0,
     ):
         self._bet_size = bet_size_usd
         self._dry_run = dry_run
@@ -176,12 +184,15 @@ class Executor:
         self._fill_prior_strength = fill_prior_strength
         self._fill_confidence_scale = fill_confidence_scale
         self._fill_lower_bound_z = fill_lower_bound_z
+        self._max_live_orders_per_day = max_live_orders_per_day
+        self._max_live_notional_usd_per_day = max_live_notional_usd_per_day
         self._clob = None
         self._db = None
         self._orders: list[TradeResult] = []
         self._skipped_low_liq = 0
         self._skipped_low_ev = 0
         self._skipped_no_edge = 0
+        self._skipped_live_limits = 0
         self._last_reconcile = 0.0
         self._fill_stats_cache: dict[tuple[str, str, str, str, str], tuple[float, FillEstimate]] = {}
 
@@ -212,6 +223,10 @@ class Executor:
     @property
     def skipped_no_edge(self) -> int:
         return self._skipped_no_edge
+
+    @property
+    def skipped_live_limits(self) -> int:
+        return self._skipped_live_limits
 
     @property
     def recent_trades(self) -> list[TradeResult]:
@@ -500,6 +515,24 @@ class Executor:
         self._orders = [t for t in self._orders if not (trade.order_id and t.order_id == trade.order_id)]
         self._orders.append(trade)
 
+    def _today_live_usage(self) -> tuple[int, float]:
+        if self._db is not None:
+            usage = get_live_daily_usage(self._db)
+            return int(usage["orders"]), float(usage["submitted_notional"])
+
+        now = time.localtime()
+        orders = 0
+        submitted_notional = 0.0
+        for trade in self._orders:
+            if trade.is_paper:
+                continue
+            ts = time.localtime(trade.timestamp)
+            if (ts.tm_year, ts.tm_yday) != (now.tm_year, now.tm_yday):
+                continue
+            orders += 1
+            submitted_notional += trade.cost_usd
+        return orders, submitted_notional
+
     def _persist_trade(self, trade: TradeResult, raw_data: Any | None = None):
         if self._db is None:
             return
@@ -738,6 +771,27 @@ class Executor:
         shares = self._bet_size / q
         if shares < market.order_min_size:
             return None
+
+        if not self._dry_run:
+            live_orders_today, live_notional_today = self._today_live_usage()
+            if self._max_live_orders_per_day > 0 and live_orders_today >= self._max_live_orders_per_day:
+                self._skipped_live_limits += 1
+                logger.warning(
+                    f"Skip live trade: daily order limit reached "
+                    f"({live_orders_today}/{self._max_live_orders_per_day})"
+                )
+                return None
+            if (
+                self._max_live_notional_usd_per_day > 0
+                and live_notional_today + self._bet_size > self._max_live_notional_usd_per_day + 1e-9
+            ):
+                self._skipped_live_limits += 1
+                logger.warning(
+                    f"Skip live trade: daily notional cap reached "
+                    f"(${live_notional_today:.2f} + ${self._bet_size:.2f} > "
+                    f"${self._max_live_notional_usd_per_day:.2f})"
+                )
+                return None
 
         filled_ev = self._bet_size * (p / q - 1)
         fill_estimate = self._estimate_fill_ratio(
