@@ -627,7 +627,24 @@ class Executor:
             tick_size=tick_size,
         )
 
-    def _resolve_token_quote(self, token_id: str, token_price: float) -> TokenQuote:
+    def _resolve_token_quote(
+        self,
+        token_id: str,
+        token_price: float,
+        market: CryptoMarket | None = None,
+        *,
+        direction: str = "",
+    ) -> TokenQuote:
+        if self._dry_run and market is not None:
+            if direction.upper() == "UP" and (market.up_best_bid > 0 or market.up_best_ask > 0):
+                tick_size = max(market.up_tick_size, 0.001)
+                spread = market.up_spread if market.up_spread > 0 else max(0.0, market.up_best_ask - market.up_best_bid)
+                return TokenQuote(token_id, market.up_best_bid, market.up_best_ask, spread, tick_size)
+            if direction.upper() == "DOWN" and (market.down_best_bid > 0 or market.down_best_ask > 0):
+                tick_size = max(market.down_tick_size, 0.001)
+                spread = market.down_spread if market.down_spread > 0 else max(0.0, market.down_best_ask - market.down_best_bid)
+                return TokenQuote(token_id, market.down_best_bid, market.down_best_ask, spread, tick_size)
+
         if not self._dry_run:
             try:
                 clob = self._ensure_clob()
@@ -1010,7 +1027,7 @@ class Executor:
         if token_price <= 0.01 or token_price >= 0.99:
             return None
 
-        quote = self._resolve_token_quote(token_id, token_price)
+        quote = self._resolve_token_quote(token_id, token_price, market, direction=signal.direction.value)
         tick_size = max(quote.tick_size, 0.001)
         best_bid = quote.best_bid
         best_ask = quote.best_ask

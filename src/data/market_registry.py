@@ -66,6 +66,14 @@ class CryptoMarket:
     volume: float = 0.0
     liquidity: float = 0.0
     spread: float = 0.0
+    up_best_bid: float = 0.0
+    up_best_ask: float = 0.0
+    up_spread: float = 0.0
+    up_tick_size: float = 0.01
+    down_best_bid: float = 0.0
+    down_best_ask: float = 0.0
+    down_spread: float = 0.0
+    down_tick_size: float = 0.01
     resolution_source: str = ""
     description: str = ""
     fees_enabled: bool = True

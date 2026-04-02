@@ -89,7 +89,8 @@ class ReplayTests(unittest.TestCase):
                 "liquidity": 5000,
                 "secs_remaining": 600,
                 "secs_elapsed": 300,
-                "final_price": 102000,
+                "resolved_official_opening_price": 100000,
+                "resolved_official_final_price": 102000,
             },
             {
                 "timestamp": 1_700_000_030,
@@ -104,7 +105,8 @@ class ReplayTests(unittest.TestCase):
                 "liquidity": 5000,
                 "secs_remaining": 570,
                 "secs_elapsed": 330,
-                "final_price": 102000,
+                "resolved_official_opening_price": 100000,
+                "resolved_official_final_price": 102000,
             },
         ]
 
@@ -164,6 +166,94 @@ class ReplayTests(unittest.TestCase):
         self.assertEqual(summary.signals, 1)
         self.assertEqual(summary.trades, 1)
         self.assertGreater(summary.expected_submitted_ev, 0)
+
+    def test_dry_run_replay_uses_token_level_down_quote(self):
+        config = {
+            "strategy": {
+                "symbols": ["btcusdt"],
+                "edge_threshold_pct": 0.003,
+                "min_secs_remaining": 30,
+                "min_secs_elapsed": 30,
+                "annual_vol_btcusdt": 0.60,
+                "signal_cooldown_sec": 120,
+                "bet_size_usd": 15,
+                "min_liquidity": 1000,
+                "min_ev_usd": 0.10,
+                "adverse_selection_haircut": 0.05,
+                "maker_offset_ticks": 1,
+                "fill_rate_prior": 0.35,
+            }
+        }
+        rows = [
+            {
+                "timestamp": 1_700_000_000,
+                "symbol": "btcusdt",
+                "window_start": 1_699_999_900,
+                "binance_price": 99000,
+                "opening_price": 100000,
+                "up_price": 0.62,
+                "down_price": 0.38,
+                "up_best_bid": 0.61,
+                "up_best_ask": 0.63,
+                "down_best_bid": 0.37,
+                "down_best_ask": 0.39,
+                "down_spread": 0.02,
+                "down_tick_size": 0.01,
+                "liquidity": 5000,
+                "secs_remaining": 600,
+                "secs_elapsed": 300,
+                "resolved_settle_side": "DOWN",
+            },
+        ]
+
+        summary = run_replay(rows, config)
+
+        self.assertEqual(summary.trades, 1)
+        trade = summary.trade_log[0]
+        self.assertEqual(trade.direction, "DOWN")
+        self.assertAlmostEqual(trade.quote_price, 0.37, places=6)
+
+    def test_replay_realized_pnl_requires_resolved_truth(self):
+        config = {
+            "strategy": {
+                "symbols": ["btcusdt"],
+                "edge_threshold_pct": 0.003,
+                "min_secs_remaining": 30,
+                "min_secs_elapsed": 30,
+                "annual_vol_btcusdt": 0.60,
+                "signal_cooldown_sec": 120,
+                "bet_size_usd": 15,
+                "min_liquidity": 1000,
+                "min_ev_usd": 0.10,
+                "adverse_selection_haircut": 0.05,
+                "maker_offset_ticks": 1,
+                "fill_rate_prior": 0.35,
+            }
+        }
+        rows = [
+            {
+                "timestamp": 1_700_000_000,
+                "symbol": "btcusdt",
+                "window_start": 1_699_999_900,
+                "binance_price": 101000,
+                "opening_price": 100000,
+                "up_price": 0.62,
+                "down_price": 0.38,
+                "up_best_bid": 0.61,
+                "up_best_ask": 0.63,
+                "liquidity": 5000,
+                "secs_remaining": 600,
+                "secs_elapsed": 300,
+                "final_price": 102000,
+                "settle_side": "UP",
+            },
+        ]
+
+        summary = run_replay(rows, config)
+
+        self.assertEqual(summary.trades, 1)
+        self.assertEqual(summary.realized_submitted_pnl, 0.0)
+        self.assertIsNone(summary.trade_log[0].realized_submitted_pnl)
 
 
 if __name__ == "__main__":

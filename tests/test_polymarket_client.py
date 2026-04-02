@@ -129,6 +129,64 @@ class PolymarketClientTests(unittest.TestCase):
         self.assertEqual(client.post_heartbeat("hb-0")["heartbeat_id"], "hb-1")
         self.assertIn(("heartbeat", "hb-0"), events)
 
+    def test_client_supports_public_level0_mode_without_private_key(self):
+        events: list[tuple[str, object]] = []
+
+        class FakeClobClient:
+            def __init__(self, *args, **kwargs):
+                events.append(("init", {"args": args, "kwargs": kwargs}))
+
+        fake_client_mod = types.ModuleType("py_clob_client.client")
+        fake_client_mod.ClobClient = FakeClobClient
+        fake_root_mod = types.ModuleType("py_clob_client")
+        fake_root_mod.client = fake_client_mod
+
+        original_root = sys.modules.get("py_clob_client")
+        original_client = sys.modules.get("py_clob_client.client")
+        sys.modules["py_clob_client"] = fake_root_mod
+        sys.modules["py_clob_client.client"] = fake_client_mod
+        try:
+            client = PolymarketCLOBClient("")
+            client._ensure_client()
+        finally:
+            if original_root is None:
+                sys.modules.pop("py_clob_client", None)
+            else:
+                sys.modules["py_clob_client"] = original_root
+            if original_client is None:
+                sys.modules.pop("py_clob_client.client", None)
+            else:
+                sys.modules["py_clob_client.client"] = original_client
+
+        init_event = next(payload for kind, payload in events if kind == "init")
+        self.assertEqual(init_event["args"], ("https://clob.polymarket.com",))
+        self.assertEqual(init_event["kwargs"], {})
+
+    def test_extract_resolved_truth_prefers_resolved_outcome_prices(self):
+        event = {
+            "slug": "btc-updown-15m-123",
+            "markets": [
+                {
+                    "conditionId": "0xcond",
+                    "active": False,
+                    "closed": True,
+                    "outcomes": "[\"Up\", \"Down\"]",
+                    "outcomePrices": "[1,0]",
+                }
+            ],
+        }
+        metadata = {
+            "official_opening_price": 100000.0,
+            "official_current_price": 100200.0,
+        }
+
+        truth = PolymarketGammaClient._extract_resolved_truth("btc-updown-15m-123", event, metadata)
+
+        self.assertTrue(truth["resolved_truth_available"])
+        self.assertEqual(truth["resolved_settle_side"], "UP")
+        self.assertEqual(truth["resolved_truth_source"], "gamma_outcome_prices")
+        self.assertAlmostEqual(truth["resolved_official_opening_price"], 100000.0, places=6)
+
 
 if __name__ == "__main__":
     unittest.main()

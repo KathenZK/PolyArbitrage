@@ -90,6 +90,17 @@ class PolymarketGammaClient:
         }
         return await self._get("/events", params)
 
+    async def get_event_by_slug(self, slug: str) -> dict | None:
+        session = await self._ensure_session()
+        async with session.get(
+            f"{GAMMA_BASE}/events",
+            params={"slug": slug},
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as r:
+            r.raise_for_status()
+            events = await r.json()
+        return events[0] if events else None
+
     async def get_positions(
         self,
         user: str,
@@ -166,6 +177,85 @@ class PolymarketGammaClient:
             }
         return {}
 
+    @staticmethod
+    def _parse_list_field(raw: Any) -> list[Any]:
+        if raw is None:
+            return []
+        if isinstance(raw, str):
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                return []
+            return parsed if isinstance(parsed, list) else []
+        if isinstance(raw, list):
+            return raw
+        return []
+
+    @classmethod
+    def _parse_outcome_prices(cls, raw: Any) -> list[float]:
+        prices: list[float] = []
+        for item in cls._parse_list_field(raw):
+            try:
+                prices.append(float(item))
+            except (TypeError, ValueError):
+                continue
+        return prices
+
+    @staticmethod
+    def _normalize_settle_side(label: str) -> str:
+        normalized = str(label or "").strip().upper()
+        if normalized in {"UP", "DOWN"}:
+            return normalized
+        return normalized
+
+    @classmethod
+    def _extract_resolved_truth(
+        cls,
+        slug: str,
+        event: dict,
+        metadata: dict[str, float] | None = None,
+    ) -> dict[str, Any]:
+        markets = event.get("markets", []) if isinstance(event, dict) else []
+        market = markets[0] if markets else {}
+        outcomes = cls._parse_list_field(market.get("outcomes"))
+        outcome_prices = cls._parse_outcome_prices(market.get("outcomePrices"))
+        closed = bool(market.get("closed", False))
+        active = bool(market.get("active", False))
+
+        resolved_side = ""
+        truth_source = ""
+        if len(outcomes) >= 2 and len(outcome_prices) >= 2:
+            up_price = float(outcome_prices[0])
+            down_price = float(outcome_prices[1])
+            if up_price >= 0.999 and down_price <= 0.001:
+                resolved_side = cls._normalize_settle_side(str(outcomes[0]))
+                truth_source = "gamma_outcome_prices"
+            elif down_price >= 0.999 and up_price <= 0.001:
+                resolved_side = cls._normalize_settle_side(str(outcomes[1]))
+                truth_source = "gamma_outcome_prices"
+
+        metadata = metadata or {}
+        official_opening = float(metadata.get("official_opening_price", 0) or 0)
+        official_final = float(metadata.get("official_current_price", 0) or 0)
+        if not resolved_side and official_opening > 0 and official_final > 0:
+            resolved_side = "UP" if official_final >= official_opening else "DOWN"
+            truth_source = "event_page_metadata"
+
+        return {
+            "market_slug": slug,
+            "condition_id": str(market.get("conditionId", "") or ""),
+            "market_closed": closed,
+            "market_active": active,
+            "resolved_truth_available": bool(resolved_side),
+            "resolved_truth_source": truth_source,
+            "resolved_settle_side": resolved_side,
+            "resolved_up_price": outcome_prices[0] if outcome_prices else 0.0,
+            "resolved_down_price": outcome_prices[1] if len(outcome_prices) > 1 else 0.0,
+            "resolved_official_opening_price": official_opening,
+            "resolved_official_final_price": official_final,
+            "resolved_checked_at": time.time(),
+        }
+
     async def get_event_page_metadata(self, slug: str) -> dict[str, float]:
         """Fetch the official event page metadata exposed to users.
 
@@ -180,13 +270,30 @@ class PolymarketGammaClient:
             html = await r.text()
         return self._parse_event_page_metadata(slug, html)
 
+    async def get_resolved_truth(self, slug: str) -> dict[str, Any]:
+        event = await self.get_event_by_slug(slug)
+        if not event:
+            return {
+                "market_slug": slug,
+                "resolved_truth_available": False,
+                "resolved_truth_source": "",
+                "resolved_checked_at": time.time(),
+            }
+
+        metadata: dict[str, float] = {}
+        try:
+            metadata = await self.get_event_page_metadata(slug)
+        except Exception:
+            metadata = {}
+        return self._extract_resolved_truth(slug, event, metadata)
+
 
 class PolymarketCLOBClient:
     """Wrapper around py-clob-client with post-only + GTD support."""
 
     def __init__(
         self,
-        private_key: str,
+        private_key: str = "",
         chain_id: int = 137,
         *,
         signature_type: int = 0,
@@ -214,26 +321,29 @@ class PolymarketCLOBClient:
                     "before enabling live Polymarket trading."
                 ) from exc
 
-            client_kwargs = {
-                "host": "https://clob.polymarket.com",
-                "chain_id": self._chain_id,
-                "key": self._key,
-                "signature_type": self._signature_type,
-            }
-            if self._funder:
-                client_kwargs["funder"] = self._funder
+            if self._key:
+                client_kwargs = {
+                    "host": "https://clob.polymarket.com",
+                    "chain_id": self._chain_id,
+                    "key": self._key,
+                    "signature_type": self._signature_type,
+                }
+                if self._funder:
+                    client_kwargs["funder"] = self._funder
 
-            self._client = ClobClient(**client_kwargs)
-            if self._api_key and self._api_secret and self._api_passphrase:
-                self._client.set_api_creds(
-                    {
-                        "key": self._api_key,
-                        "secret": self._api_secret,
-                        "passphrase": self._api_passphrase,
-                    }
-                )
+                self._client = ClobClient(**client_kwargs)
+                if self._api_key and self._api_secret and self._api_passphrase:
+                    self._client.set_api_creds(
+                        {
+                            "key": self._api_key,
+                            "secret": self._api_secret,
+                            "passphrase": self._api_passphrase,
+                        }
+                    )
+                else:
+                    self._client.set_api_creds(self._client.create_or_derive_api_creds())
             else:
-                self._client.set_api_creds(self._client.create_or_derive_api_creds())
+                self._client = ClobClient("https://clob.polymarket.com")
         return self._client
 
     def get_orderbook(self, token_id: str) -> Any:

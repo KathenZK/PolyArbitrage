@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.data.binance_stream import BinanceStream, Tick
 from src.data.market_registry import MarketRegistry
-from src.data.polymarket_client import PolymarketGammaClient
+from src.data.polymarket_client import PolymarketCLOBClient, PolymarketGammaClient, TokenBookSnapshot
 
 logger = logging.getLogger("snapshot_recorder")
 
@@ -38,6 +38,7 @@ class SnapshotRecorder:
 
         assets = [a.replace("usdt", "") for a in strat.get("symbols", ["btcusdt", "ethusdt", "solusdt"])]
         self.gamma = PolymarketGammaClient()
+        self.clob = PolymarketCLOBClient("")
         self.registry = MarketRegistry(
             self.gamma,
             assets=assets,
@@ -129,7 +130,8 @@ class SnapshotRecorder:
         if not self._should_snapshot(tick, market):
             return
 
-        row = self._build_snapshot_row(tick, market)
+        up_book, down_book = await asyncio.to_thread(self._fetch_token_books, market)
+        row = self._build_snapshot_row(tick, market, up_book, down_book)
         self._write_jsonl(self._snapshot_fp, row)
         self._last_snapshot_ts[tick.symbol] = tick.timestamp
         self._last_snapshot_price[tick.symbol] = tick.price
@@ -150,7 +152,20 @@ class SnapshotRecorder:
         move_pct = abs(tick.price - prev_price) / prev_price
         return move_pct >= self.min_price_move_pct
 
-    def _build_snapshot_row(self, tick: Tick, market) -> dict:
+    def _fetch_token_books(self, market) -> tuple[TokenBookSnapshot, TokenBookSnapshot]:
+        try:
+            up_book = self.clob.get_book_snapshot(market.up_token_id)
+        except Exception as exc:
+            logger.debug(f"Up book fetch failed for {market.up_token_id}: {exc}")
+            up_book = TokenBookSnapshot(market.up_token_id, 0.0, 0.0, 0.0, 0.01)
+        try:
+            down_book = self.clob.get_book_snapshot(market.down_token_id)
+        except Exception as exc:
+            logger.debug(f"Down book fetch failed for {market.down_token_id}: {exc}")
+            down_book = TokenBookSnapshot(market.down_token_id, 0.0, 0.0, 0.0, 0.01)
+        return up_book, down_book
+
+    def _build_snapshot_row(self, tick: Tick, market, up_book: TokenBookSnapshot, down_book: TokenBookSnapshot) -> dict:
         deviation = 0.0
         if market.has_opening_price and market.opening_price > 0:
             deviation = (tick.price - market.opening_price) / market.opening_price
@@ -184,6 +199,14 @@ class SnapshotRecorder:
             "down_token_id": market.down_token_id,
             "up_price": market.up_price,
             "down_price": market.down_price,
+            "up_best_bid": up_book.best_bid,
+            "up_best_ask": up_book.best_ask,
+            "up_spread": up_book.spread,
+            "up_tick_size": up_book.tick_size,
+            "down_best_bid": down_book.best_bid,
+            "down_best_ask": down_book.best_ask,
+            "down_spread": down_book.spread,
+            "down_tick_size": down_book.tick_size,
             "best_bid": market.best_bid,
             "best_ask": market.best_ask,
             "spread": market.spread,

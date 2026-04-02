@@ -145,7 +145,7 @@ def build_markets_table(pipeline: Pipeline) -> Table:
     table.add_column("看跌", width=6, justify="right")
     table.add_column("价差", width=5, justify="right")
     table.add_column("锚定价", width=11, justify="right")
-    table.add_column("源", width=3, justify="center")
+    table.add_column("源", width=5, justify="center")
     table.add_column("剩余", width=8, justify="right")
     table.add_column("流动性", width=9, justify="right")
 
@@ -178,11 +178,11 @@ def build_markets_table(pipeline: Pipeline) -> Table:
             spread_style = "dim"
 
         if m.has_official_calibration and m.official_calibration_age < 90:
-            src = Text("官", style="green")
+            src = Text("Poly", style="green")
         elif m.has_official_calibration:
-            src = Text("官", style="yellow")
+            src = Text("Poly", style="yellow")
         elif m.has_opening_price:
-            src = Text("币", style="dim")
+            src = Text("币安", style="dim")
         else:
             src = Text("--", style="dim")
 

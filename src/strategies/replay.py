@@ -2,12 +2,12 @@
 
 Input rows can come from CSV or JSONL and should include at least:
     timestamp, symbol, binance_price, opening_price,
-    up_price, down_price, best_bid, best_ask, liquidity, secs_remaining
+    up_price, down_price, liquidity, secs_remaining
 
 To score realized PnL, provide either:
-    settle_side    -> "UP" / "DOWN"
+    resolved_settle_side -> "UP" / "DOWN"
 or
-    final_price    -> compared against opening_price
+    resolved_official_final_price / resolved_official_opening_price
 """
 
 from __future__ import annotations
@@ -137,6 +137,14 @@ def _build_market(row: dict[str, Any]) -> CryptoMarket:
         official_binance_ref_price=_parse_float(row, "official_binance_ref_price", 0.0),
         official_price_updated_at=_parse_float(row, "official_price_updated_at", 0.0),
         official_binance_ref_ts=_parse_float(row, "official_binance_ref_ts", 0.0),
+        up_best_bid=_parse_float(row, "up_best_bid", _parse_float(row, "best_bid", 0.0)),
+        up_best_ask=_parse_float(row, "up_best_ask", _parse_float(row, "best_ask", 0.0)),
+        up_spread=_parse_float(row, "up_spread", _parse_float(row, "spread", 0.0)),
+        up_tick_size=_parse_float(row, "up_tick_size", 0.01),
+        down_best_bid=_parse_float(row, "down_best_bid", 0.0),
+        down_best_ask=_parse_float(row, "down_best_ask", 0.0),
+        down_spread=_parse_float(row, "down_spread", 0.0),
+        down_tick_size=_parse_float(row, "down_tick_size", 0.01),
     )
 
 
@@ -235,21 +243,27 @@ def signal_from_row(
 
 def _settle_side(row: dict[str, Any], opening_price: float) -> str | None:
     raw = str(
-        row.get("official_settle_side")
-        or row.get("settle_side")
-        or row.get("settlement_side")
+        row.get("resolved_settle_side")
+        or row.get("official_resolved_settle_side")
         or ""
     ).strip().upper()
     if raw in {"UP", "DOWN"}:
         return raw
 
-    final_price = row.get(
-        "official_final_price",
-        row.get("final_price", row.get("settlement_price", "")),
+    final_price = (
+        row.get("resolved_official_final_price")
+        or row.get("resolved_final_price")
+        or ""
     )
     if final_price in (None, ""):
         return None
-    return "UP" if float(final_price) >= opening_price else "DOWN"
+    resolved_open = row.get("resolved_official_opening_price", row.get("resolved_opening_price", opening_price))
+    try:
+        base = float(resolved_open or opening_price)
+        final = float(final_price)
+    except (TypeError, ValueError):
+        return None
+    return "UP" if final >= base else "DOWN"
 
 
 def _filled_pnl(plan: TradePlan, settle_side: str | None) -> float | None:
