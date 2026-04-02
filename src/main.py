@@ -228,21 +228,21 @@ class Pipeline:
             country = geo.get("country", "?")
             ip = geo.get("ip", "?")
             if blocked:
-                console.print(f"[bold red]BLOCKED: IP {ip} in {country} — trading not allowed[/bold red]")
-                console.print("Use a VPN to a non-blocked region, or switch to paper mode.")
+                console.print(f"[bold red]已封锁: IP {ip} 位于 {country} — 禁止交易[/bold red]")
+                console.print("请使用VPN切换到未封锁地区，或切换到模拟模式。")
                 return False
-            console.print(f"  Geo:     {country} ({ip}) — [green]OK[/green]")
+            console.print(f"  地区:    {country} ({ip}) — [green]正常[/green]")
             return True
         except Exception as e:
             logger.warning(f"Geoblock check failed: {e}")
-            console.print("  Geo:     check failed — [bold red]blocking live startup[/bold red]")
+            console.print("  地区:    检查失败 — [bold red]阻止实盘启动[/bold red]")
             return False
 
     async def _run_live_preflight(self) -> bool:
         require_live_arm = self.config.get("risk", {}).get("require_live_arm", True)
         if require_live_arm and os.getenv("LIVE_TRADING_ARMED", "").strip().upper() != "YES":
-            console.print("[bold red]LIVE trading arm switch not set[/bold red]")
-            console.print("Set `LIVE_TRADING_ARMED=YES` in `.env` before disabling `dry_run`.")
+            console.print("[bold red]实盘交易开关未设置[/bold red]")
+            console.print("请在 `.env` 中设置 `LIVE_TRADING_ARMED=YES`，然后再关闭 `dry_run`。")
             return False
 
         geo_ok = await self._check_geoblock()
@@ -251,37 +251,37 @@ class Pipeline:
 
         report = self.executor.live_preflight()
         if not report.ok:
-            console.print("[bold red]Live preflight failed[/bold red]")
+            console.print("[bold red]实盘预检失败[/bold red]")
             for issue in report.issues:
                 console.print(f"  - {issue}")
             return False
 
-        console.print(f"  Signer:  {report.signer_address or '?'}")
-        console.print(f"  Funder:  {report.funder_address or '?'}")
-        console.print(f"  SigType: {report.signature_type}")
+        console.print(f"  签名者:   {report.signer_address or '?'}")
+        console.print(f"  出资者:   {report.funder_address or '?'}")
+        console.print(f"  签名类型: {report.signature_type}")
         console.print(f"  USDC:    ${report.collateral_balance:,.6f}")
-        allowance_text = "unlimited" if report.max_allowance >= 1_000_000 else f"${report.max_allowance:,.6f}"
-        console.print(f"  Allow:   {allowance_text}")
+        allowance_text = "无限制" if report.max_allowance >= 1_000_000 else f"${report.max_allowance:,.6f}"
+        console.print(f"  授权额度: {allowance_text}")
         for warning in report.warnings:
-            console.print(f"  Warn:    {warning}")
+            console.print(f"  警告:    {warning}")
 
         redeem_report = await self.redeemer.preflight()
         if not redeem_report.ok:
-            console.print("[bold red]Redeem preflight failed[/bold red]")
+            console.print("[bold red]赎回预检失败[/bold red]")
             for issue in redeem_report.issues:
                 console.print(f"  - {issue}")
             return False
 
         if redeem_report.enabled:
-            console.print("  Redeem:  armed")
-            console.print(f"  Owner:   {redeem_report.owner or '?'}")
-            console.print(f"  Proxy:   {redeem_report.derived_proxy or '?'}")
+            console.print("  赎回:    已激活")
+            console.print(f"  所有者:   {redeem_report.owner or '?'}")
+            console.print(f"  代理:    {redeem_report.derived_proxy or '?'}")
             if redeem_report.relay_address:
-                console.print(f"  Relay:   {redeem_report.relay_address} (nonce {redeem_report.relay_nonce or '0'})")
+                console.print(f"  中继:    {redeem_report.relay_address} (nonce {redeem_report.relay_nonce or '0'})")
             for warning in redeem_report.warnings:
-                console.print(f"  Warn:    {warning}")
+                console.print(f"  警告:    {warning}")
         else:
-            console.print("  Redeem:  disabled in config")
+            console.print("  赎回:    配置中已禁用")
         return True
 
     async def run(self):
@@ -289,16 +289,16 @@ class Pipeline:
         symbols = self.config.get("strategy", {}).get("symbols", ["btcusdt"])
         self.start_time = time.time()
 
-        console.print("[bold blue]PolyArbitrage — Latency Arb Pipeline[/bold blue]")
-        console.print(f"  Mode:    {'PAPER' if dry_run else '[bold red]LIVE[/bold red]'}")
-        console.print(f"  Symbols: {[s.replace('usdt','').upper() for s in symbols]}")
-        console.print(f"  Bet:     ${self.config.get('strategy', {}).get('bet_size_usd', 15)}/trade")
+        console.print("[bold blue]PolyArbitrage — 延迟套利系统[/bold blue]")
+        console.print(f"  模式:    {'模拟' if dry_run else '[bold red]实盘[/bold red]'}")
+        console.print(f"  品种:    {[s.replace('usdt','').upper() for s in symbols]}")
+        console.print(f"  下注:    ${self.config.get('strategy', {}).get('bet_size_usd', 15)}/笔")
 
         if not dry_run:
             if not await self._run_live_preflight():
                 return
         else:
-            console.print(f"  Geo:     skipped (paper mode)")
+            console.print(f"  地区:    已跳过（模拟模式）")
 
         console.print()
 
@@ -410,7 +410,7 @@ def main():
         else:
             asyncio.run(pipeline.run())
     except KeyboardInterrupt:
-        console.print("\n[yellow]Shutting down...[/yellow]")
+        console.print("\n[yellow]正在关闭...[/yellow]")
         asyncio.run(pipeline.shutdown())
 
 
