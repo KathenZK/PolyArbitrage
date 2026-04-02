@@ -30,7 +30,7 @@ load_dotenv()
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.data.binance_stream import BinanceStream, Tick
-from src.data.market_registry import MarketRegistry, current_window_start
+from src.data.market_registry import MarketRegistry
 from src.data.polymarket_client import PolymarketGammaClient
 from src.output.alerts import DingTalkAlert
 from src.output.db import get_connection, init_db
@@ -63,6 +63,7 @@ class Pipeline:
             self.gamma,
             assets=assets,
             refresh_interval=strat.get("registry_refresh_sec", 15),
+            official_refresh_interval=strat.get("official_refresh_sec", 60),
             min_liquidity=strat.get("min_liquidity", 1000),
         )
         annual_vols = {}
@@ -77,6 +78,10 @@ class Pipeline:
             min_secs_remaining=strat.get("min_secs_remaining", 30),
             min_secs_elapsed=strat.get("min_secs_elapsed", 30),
             annual_vols=annual_vols if annual_vols else None,
+            require_official_source=strat.get("require_official_source", False),
+            official_max_age_secs=strat.get("official_max_age_sec", 90),
+            max_source_divergence_pct=strat.get("max_source_divergence_pct", 0.0025),
+            source_gap_penalty_mult=strat.get("source_gap_penalty_mult", 8.0),
         )
         self.guard = SignalGuard(
             cooldown_secs=strat.get("signal_cooldown_sec", 120),
@@ -183,13 +188,40 @@ class Pipeline:
             console.print(f"  Geo:     {country} ({ip}) — [green]OK[/green]")
             return True
         except Exception as e:
-            logger.warning(f"Geoblock check failed: {e} (proceeding anyway)")
-            console.print(f"  Geo:     check failed — proceeding")
-            return True
+            logger.warning(f"Geoblock check failed: {e}")
+            console.print("  Geo:     check failed — [bold red]blocking live startup[/bold red]")
+            return False
+
+    async def _run_live_preflight(self) -> bool:
+        require_live_arm = self.config.get("risk", {}).get("require_live_arm", True)
+        if require_live_arm and os.getenv("LIVE_TRADING_ARMED", "").strip().upper() != "YES":
+            console.print("[bold red]LIVE trading arm switch not set[/bold red]")
+            console.print("Set `LIVE_TRADING_ARMED=YES` in `.env` before disabling `dry_run`.")
+            return False
+
+        geo_ok = await self._check_geoblock()
+        if not geo_ok:
+            return False
+
+        report = self.executor.live_preflight()
+        if not report.ok:
+            console.print("[bold red]Live preflight failed[/bold red]")
+            for issue in report.issues:
+                console.print(f"  - {issue}")
+            return False
+
+        console.print(f"  Signer:  {report.signer_address or '?'}")
+        console.print(f"  Funder:  {report.funder_address or '?'}")
+        console.print(f"  SigType: {report.signature_type}")
+        console.print(f"  USDC:    ${report.collateral_balance:,.6f}")
+        allowance_text = "unlimited" if report.max_allowance >= 1_000_000 else f"${report.max_allowance:,.6f}"
+        console.print(f"  Allow:   {allowance_text}")
+        for warning in report.warnings:
+            console.print(f"  Warn:    {warning}")
+        return True
 
     async def run(self):
         dry_run = self.config.get("risk", {}).get("dry_run", True)
-        require_live_arm = self.config.get("risk", {}).get("require_live_arm", True)
         symbols = self.config.get("strategy", {}).get("symbols", ["btcusdt"])
         self.start_time = time.time()
 
@@ -199,12 +231,7 @@ class Pipeline:
         console.print(f"  Bet:     ${self.config.get('strategy', {}).get('bet_size_usd', 15)}/trade")
 
         if not dry_run:
-            if require_live_arm and os.getenv("LIVE_TRADING_ARMED", "").strip().upper() != "YES":
-                console.print("[bold red]LIVE trading arm switch not set[/bold red]")
-                console.print("Set `LIVE_TRADING_ARMED=YES` in `.env` before disabling `dry_run`.")
-                return
-            geo_ok = await self._check_geoblock()
-            if not geo_ok:
+            if not await self._run_live_preflight():
                 return
         else:
             console.print(f"  Geo:     skipped (paper mode)")
@@ -242,13 +269,10 @@ class Pipeline:
 
     async def run_headless(self):
         self.start_time = time.time()
-        if (
-            not self.config.get("risk", {}).get("dry_run", True)
-            and self.config.get("risk", {}).get("require_live_arm", True)
-            and os.getenv("LIVE_TRADING_ARMED", "").strip().upper() != "YES"
-        ):
-            logger.error("LIVE_TRADING_ARMED=YES is required before disabling dry_run")
-            return
+        if not self.config.get("risk", {}).get("dry_run", True):
+            if not await self._run_live_preflight():
+                logger.error("Live preflight failed")
+                return
         logger.info("Pipeline started (headless)")
 
         self._db_conn = get_connection()

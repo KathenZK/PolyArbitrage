@@ -28,8 +28,8 @@ def build_prices_panel(pipeline: Pipeline) -> Panel:
         market = pipeline.registry.get_market(symbol)
         open_str = ""
         dev_str = ""
-        if market and market.has_opening_price:
-            op = market.opening_price
+        if market and (market.has_official_opening_price or market.has_opening_price):
+            op = market.official_opening_price if market.has_official_opening_price else market.opening_price
             dev = (price - op) / op
             open_str = f"  open ${op:>10,.2f}"
             style = "green" if dev >= 0 else "red"
@@ -45,13 +45,14 @@ def build_prices_panel(pipeline: Pipeline) -> Panel:
 
     if not pipeline.last_prices:
         text.append("  Connecting to Binance...", style="dim")
-    return Panel(text, title="Prices (Binance vs Open)", border_style="cyan")
+    return Panel(text, title="Prices (Binance vs Anchor)", border_style="cyan")
 
 
 def build_signals_table(pipeline: Pipeline) -> Table:
     table = Table(title="Signals", expand=True, border_style="yellow")
     table.add_column("Time", width=8)
     table.add_column("Sym", width=4)
+    table.add_column("Src", width=5)
     table.add_column("Dir", width=5)
     table.add_column("Dev", width=7, justify="right")
     table.add_column("p", width=6, justify="right")
@@ -63,12 +64,13 @@ def build_signals_table(pipeline: Pipeline) -> Table:
         table.add_row(
             ts,
             sig.asset,
+            "DUAL" if sig.price_source == "dual_calibrated" else "BIN",
             Text(sig.direction.value, style=f"bold {style}"),
             Text(f"{sig.deviation_pct:+.2%}", style=style),
             f"{sig.win_prob:.1%}",
         )
     if not pipeline.signals:
-        table.add_row("", "", Text("waiting...", style="dim"), "", "")
+        table.add_row("", "", "", Text("waiting...", style="dim"), "", "")
     return table
 
 
@@ -116,7 +118,7 @@ def build_markets_table(pipeline: Pipeline) -> Table:
     table.add_column("Sym", width=4)
     table.add_column("Up", width=6, justify="right")
     table.add_column("Down", width=6, justify="right")
-    table.add_column("Open", width=11, justify="right")
+    table.add_column("Beat", width=11, justify="right")
     table.add_column("Left", width=7, justify="right")
     table.add_column("Liq", width=9, justify="right")
 
@@ -128,8 +130,10 @@ def build_markets_table(pipeline: Pipeline) -> Table:
         mins, sec = divmod(int(secs), 60)
         remaining = f"{mins}m{sec:02d}s"
         time_style = "bold red" if secs < 60 else "yellow" if secs < 180 else "dim"
-        open_str = f"${m.opening_price:,.2f}" if m.has_opening_price else "waiting..."
-        open_style = "white" if m.has_opening_price else "dim"
+        anchor = m.official_opening_price if m.has_official_opening_price else m.opening_price
+        has_anchor = anchor > 0
+        open_str = f"${anchor:,.2f}" if has_anchor else "waiting..."
+        open_style = "white" if has_anchor else "dim"
         table.add_row(
             sym,
             f"${m.up_price:.3f}",

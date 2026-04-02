@@ -11,6 +11,8 @@ CLOB client uses the official py-clob-client SDK with:
 from __future__ import annotations
 
 import logging
+import re
+import time
 from typing import Any
 
 import aiohttp
@@ -18,6 +20,7 @@ import aiohttp
 logger = logging.getLogger(__name__)
 
 GAMMA_BASE = "https://gamma-api.polymarket.com"
+EVENT_PAGE_BASE = "https://polymarket.com/event"
 
 
 class PolymarketGammaClient:
@@ -86,6 +89,42 @@ class PolymarketGammaClient:
         ) as r:
             return await r.json()
 
+    @staticmethod
+    def _parse_event_page_metadata(slug: str, html: str) -> dict[str, float]:
+        pattern = re.compile(
+            rf'"slug":"{re.escape(slug)}".*?"eventMetadata":\{{"finalPrice":(?P<final>[^,}}]+),"priceToBeat":(?P<beat>[^,}}]+)\}}',
+            re.DOTALL,
+        )
+        match = pattern.search(html)
+        if not match:
+            return {}
+
+        try:
+            final_price = float(match.group("final"))
+            price_to_beat = float(match.group("beat"))
+        except (TypeError, ValueError):
+            return {}
+
+        return {
+            "official_current_price": final_price,
+            "official_opening_price": price_to_beat,
+            "fetched_at": time.time(),
+        }
+
+    async def get_event_page_metadata(self, slug: str) -> dict[str, float]:
+        """Fetch the official event page metadata exposed to users.
+
+        Polymarket's event page embeds the current Chainlink-derived "finalPrice"
+        and the window's "priceToBeat". These are lighter-weight official anchors
+        than trying to integrate Chainlink Data Streams directly.
+        """
+        session = await self._ensure_session()
+        url = f"{EVENT_PAGE_BASE}/{slug}"
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as r:
+            r.raise_for_status()
+            html = await r.text()
+        return self._parse_event_page_metadata(slug, html)
+
 
 class PolymarketCLOBClient:
     """Wrapper around py-clob-client with post-only + GTD support."""
@@ -145,6 +184,20 @@ class PolymarketCLOBClient:
     def get_orderbook(self, token_id: str) -> Any:
         client = self._ensure_client()
         return client.get_order_book(token_id)
+
+    def get_signer_address(self) -> str:
+        client = self._ensure_client()
+        return str(client.get_address())
+
+    def get_collateral_balance_allowance(self, signature_type: int | None = None) -> Any:
+        client = self._ensure_client()
+        from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
+
+        params = BalanceAllowanceParams(
+            asset_type=AssetType.COLLATERAL,
+            signature_type=self._signature_type if signature_type is None else signature_type,
+        )
+        return client.get_balance_allowance(params)
 
     @staticmethod
     def _read_level_value(level: Any, field: str) -> float:

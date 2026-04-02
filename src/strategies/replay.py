@@ -111,6 +111,7 @@ def _build_market(row: dict[str, Any]) -> CryptoMarket:
     return CryptoMarket(
         market_id=str(row.get("market_id") or row.get("id") or f"{asset}-{window_start}"),
         question=str(row.get("question") or f"Will {asset.upper()} end the window up?"),
+        description=str(row.get("description") or ""),
         slug=str(row.get("market_slug") or f"{asset}-updown-15m-{window_start}"),
         asset=asset,
         binance_symbol=symbol,
@@ -126,9 +127,14 @@ def _build_market(row: dict[str, Any]) -> CryptoMarket:
         volume=_parse_float(row, "volume", 0.0),
         liquidity=_parse_float(row, "liquidity", 0.0),
         spread=_parse_float(row, "spread", 0.0),
+        resolution_source=str(row.get("resolution_source") or ""),
         fees_enabled=bool(row.get("fees_enabled", True)),
         fee_rate=_parse_float(row, "fee_rate", 0.072),
         order_min_size=_parse_int(row, "order_min_size", 5),
+        official_opening_price=_parse_float(row, "official_opening_price", 0.0),
+        official_current_price=_parse_float(row, "official_current_price", 0.0),
+        official_binance_ref_price=_parse_float(row, "official_binance_ref_price", 0.0),
+        official_price_updated_at=_parse_float(row, "official_price_updated_at", 0.0),
     )
 
 
@@ -139,11 +145,15 @@ def signal_from_row(
     min_secs_remaining: float,
     min_secs_elapsed: float,
     annual_vols: dict[str, float] | None = None,
+    require_official_source: bool = False,
+    official_max_age_secs: float = 90.0,
+    max_source_divergence_pct: float = 0.0025,
+    source_gap_penalty_mult: float = 8.0,
 ) -> Signal | None:
     market = _build_market(row)
-    opening_price = _parse_float(row, "opening_price", market.opening_price)
-    current_price = _parse_float(row, "binance_price", 0.0)
-    if opening_price <= 0 or current_price <= 0:
+    binance_opening = _parse_float(row, "opening_price", market.opening_price)
+    binance_price = _parse_float(row, "binance_price", 0.0)
+    if binance_price <= 0:
         return None
 
     secs_remaining = _parse_float(row, "secs_remaining", market.secs_remaining)
@@ -151,36 +161,82 @@ def signal_from_row(
     if secs_remaining < min_secs_remaining or secs_elapsed < min_secs_elapsed:
         return None
 
-    deviation = (current_price - opening_price) / opening_price
+    binance_deviation = 0.0
+    if binance_opening > 0:
+        binance_deviation = (binance_price - binance_opening) / binance_opening
+
+    projected_official_price = 0.0
+    official_deviation = 0.0
+    using_official = False
+    official_age = max(0.0, _parse_float(row, "timestamp", time.time()) - market.official_price_updated_at)
+    if market.has_official_calibration and official_age <= official_max_age_secs:
+        projected_official_price = binance_price * (market.official_current_price / market.official_binance_ref_price)
+        official_deviation = (
+            projected_official_price - market.official_opening_price
+        ) / market.official_opening_price
+        using_official = True
+
+    if not using_official and require_official_source:
+        return None
+
+    deviation = official_deviation if using_official else binance_deviation
     if abs(deviation) < threshold_pct:
         return None
+
+    if using_official and binance_opening > 0:
+        if (
+            abs(binance_deviation) >= threshold_pct
+            and abs(official_deviation) >= threshold_pct
+            and binance_deviation * official_deviation < 0
+        ):
+            return None
+        if abs(binance_deviation - official_deviation) > max_source_divergence_pct:
+            return None
 
     direction = Direction.UP if deviation > 0 else Direction.DOWN
     symbol = _symbol(row)
     annual_vol = (annual_vols or DEFAULT_ANNUAL_VOL).get(symbol, 0.70)
     win_prob = estimate_win_prob(abs(deviation), secs_remaining, annual_vol)
+    source_gap = abs(binance_deviation - official_deviation) if using_official and binance_opening > 0 else 0.0
+    if using_official and source_gap > 0:
+        win_prob = max(0.50, win_prob - min(0.20, source_gap * source_gap_penalty_mult))
     timestamp = _parse_float(row, "timestamp", time.time())
 
-    market.opening_price = opening_price
+    market.opening_price = binance_opening
     return Signal(
         asset=market.asset.upper(),
         binance_symbol=symbol,
         direction=direction,
-        current_price=current_price,
-        opening_price=opening_price,
+        current_price=projected_official_price if using_official else binance_price,
+        opening_price=market.official_opening_price if using_official else binance_opening,
         deviation_pct=deviation,
         win_prob=win_prob,
         market=market,
         timestamp=timestamp,
+        price_source="dual_calibrated" if using_official else "binance_only",
+        binance_deviation_pct=binance_deviation,
+        official_deviation_pct=official_deviation,
+        official_opening_price=market.official_opening_price,
+        official_current_price=market.official_current_price,
+        projected_official_price=projected_official_price,
+        source_gap_pct=source_gap,
     )
 
 
 def _settle_side(row: dict[str, Any], opening_price: float) -> str | None:
-    raw = str(row.get("settle_side") or row.get("settlement_side") or "").strip().upper()
+    raw = str(
+        row.get("official_settle_side")
+        or row.get("settle_side")
+        or row.get("settlement_side")
+        or ""
+    ).strip().upper()
     if raw in {"UP", "DOWN"}:
         return raw
 
-    final_price = row.get("final_price", row.get("settlement_price", ""))
+    final_price = row.get(
+        "official_final_price",
+        row.get("final_price", row.get("settlement_price", "")),
+    )
     if final_price in (None, ""):
         return None
     return "UP" if float(final_price) >= opening_price else "DOWN"
@@ -227,6 +283,10 @@ def run_replay(rows: list[dict[str, Any]], config: dict[str, Any]) -> ReplaySumm
             min_secs_remaining=strat.get("min_secs_remaining", 30),
             min_secs_elapsed=strat.get("min_secs_elapsed", 30),
             annual_vols=annual_vols if annual_vols else None,
+            require_official_source=strat.get("require_official_source", False),
+            official_max_age_secs=strat.get("official_max_age_sec", 90),
+            max_source_divergence_pct=strat.get("max_source_divergence_pct", 0.0025),
+            source_gap_penalty_mult=strat.get("source_gap_penalty_mult", 8.0),
         )
         if signal is None:
             continue

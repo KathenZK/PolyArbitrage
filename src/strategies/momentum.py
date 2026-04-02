@@ -1,7 +1,11 @@
-"""Price-vs-opening comparator with Brownian motion probability model.
+"""Dual-source comparator with a Brownian motion probability model.
 
-Estimates the true probability that the price will remain above (or below)
-the opening price at settlement, using:
+The strategy trades a Polymarket event, not raw Binance spot. We therefore:
+  - use Binance as the fast source for sub-second price moves
+  - use Polymarket's Chainlink-derived `priceToBeat` and official current price
+    snapshot as the settlement anchor
+
+The probability model still uses a simple Brownian approximation:
 
     p ≈ Φ( |d| / (σ × √τ) )
 
@@ -78,6 +82,13 @@ class Signal:
     win_prob: float
     market: CryptoMarket
     timestamp: float
+    price_source: str = "binance_only"
+    binance_deviation_pct: float = 0.0
+    official_deviation_pct: float = 0.0
+    official_opening_price: float = 0.0
+    official_current_price: float = 0.0
+    projected_official_price: float = 0.0
+    source_gap_pct: float = 0.0
 
 
 class PriceComparator:
@@ -90,19 +101,34 @@ class PriceComparator:
         min_secs_remaining: float = 30,
         min_secs_elapsed: float = 30,
         annual_vols: dict[str, float] | None = None,
+        require_official_source: bool = False,
+        official_max_age_secs: float = 90,
+        max_source_divergence_pct: float = 0.0025,
+        source_gap_penalty_mult: float = 8.0,
     ):
         self._registry = registry
         self._threshold = threshold_pct
         self._min_remaining = min_secs_remaining
         self._min_elapsed = min_secs_elapsed
         self._vols = annual_vols or DEFAULT_ANNUAL_VOL
+        self._require_official_source = require_official_source
+        self._official_max_age = official_max_age_secs
+        self._max_source_divergence = max_source_divergence_pct
+        self._source_gap_penalty_mult = source_gap_penalty_mult
+
+    @staticmethod
+    def _project_official_price(market: CryptoMarket, binance_price: float) -> float:
+        if not market.has_official_calibration or binance_price <= 0:
+            return 0.0
+
+        ratio = market.official_current_price / market.official_binance_ref_price
+        if ratio <= 0:
+            return 0.0
+        return binance_price * ratio
 
     def check(self, binance_symbol: str, price: float, timestamp: float) -> Signal | None:
         market = self._registry.get_market(binance_symbol)
         if not market:
-            return None
-
-        if not market.has_opening_price:
             return None
 
         remaining = market.secs_remaining
@@ -112,24 +138,65 @@ class PriceComparator:
         if market.secs_elapsed < self._min_elapsed:
             return None
 
-        deviation = (price - market.opening_price) / market.opening_price
+        binance_deviation = 0.0
+        if market.has_opening_price and market.opening_price > 0:
+            binance_deviation = (price - market.opening_price) / market.opening_price
 
-        if abs(deviation) < self._threshold:
+        projected_official_price = 0.0
+        official_deviation = 0.0
+        using_official = False
+        official_age = market.official_price_age
+        if market.has_official_calibration and official_age <= self._official_max_age:
+            projected_official_price = self._project_official_price(market, price)
+            if projected_official_price > 0 and market.official_opening_price > 0:
+                official_deviation = (
+                    projected_official_price - market.official_opening_price
+                ) / market.official_opening_price
+                using_official = True
+
+        if not using_official and self._require_official_source:
             return None
 
-        direction = Direction.UP if deviation > 0 else Direction.DOWN
+        effective_deviation = official_deviation if using_official else binance_deviation
+        if abs(effective_deviation) < self._threshold:
+            return None
+
+        if using_official and market.has_opening_price:
+            if (
+                abs(binance_deviation) >= self._threshold
+                and abs(official_deviation) >= self._threshold
+                and binance_deviation * official_deviation < 0
+            ):
+                return None
+            if abs(binance_deviation - official_deviation) > self._max_source_divergence:
+                return None
+
+        direction = Direction.UP if effective_deviation > 0 else Direction.DOWN
 
         annual_vol = self._vols.get(binance_symbol, 0.70)
-        win_prob = estimate_win_prob(abs(deviation), remaining, annual_vol)
+        win_prob = estimate_win_prob(abs(effective_deviation), remaining, annual_vol)
+        source_gap = abs(binance_deviation - official_deviation) if using_official and market.has_opening_price else 0.0
+        if using_official and source_gap > 0:
+            win_prob = max(0.50, win_prob - min(0.20, source_gap * self._source_gap_penalty_mult))
+
+        opening_price = market.official_opening_price if using_official else market.opening_price
+        current_price = projected_official_price if using_official else price
 
         return Signal(
             asset=market.asset.upper(),
             binance_symbol=binance_symbol,
             direction=direction,
-            current_price=price,
-            opening_price=market.opening_price,
-            deviation_pct=deviation,
+            current_price=current_price,
+            opening_price=opening_price,
+            deviation_pct=effective_deviation,
             win_prob=win_prob,
             market=market,
             timestamp=timestamp,
+            price_source="dual_calibrated" if using_official else "binance_only",
+            binance_deviation_pct=binance_deviation,
+            official_deviation_pct=official_deviation,
+            official_opening_price=market.official_opening_price,
+            official_current_price=market.official_current_price,
+            projected_official_price=projected_official_price,
+            source_gap_pct=source_gap,
         )

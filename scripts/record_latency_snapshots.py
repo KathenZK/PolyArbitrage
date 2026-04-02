@@ -109,6 +109,8 @@ class SnapshotRecorder:
                 "asset": market.asset.upper(),
                 "window_start": market.event_start,
                 "opening_price": market.opening_price,
+                "official_opening_price": market.official_opening_price,
+                "official_current_price": market.official_current_price,
                 "last_price": tick.price,
                 "last_tick_ts": tick.timestamp,
                 "end_time": market.end_time,
@@ -119,6 +121,10 @@ class SnapshotRecorder:
             current["last_tick_ts"] = tick.timestamp
             if market.has_opening_price:
                 current["opening_price"] = market.opening_price
+            if market.has_official_opening_price:
+                current["official_opening_price"] = market.official_opening_price
+            if market.has_official_current_price:
+                current["official_current_price"] = market.official_current_price
 
         if not self._should_snapshot(tick, market):
             return
@@ -162,10 +168,16 @@ class SnapshotRecorder:
             "secs_elapsed": max(0.0, tick.timestamp - market.event_start),
             "opening_price": market.opening_price,
             "has_opening_price": market.has_opening_price,
+            "official_opening_price": market.official_opening_price,
+            "official_current_price": market.official_current_price,
+            "official_binance_ref_price": market.official_binance_ref_price,
+            "official_price_updated_at": market.official_price_updated_at,
             "deviation_pct": deviation,
             "market_id": market.market_id,
             "market_slug": market.slug,
             "question": market.question,
+            "description": market.description,
+            "resolution_source": market.resolution_source,
             "up_token_id": market.up_token_id,
             "down_token_id": market.down_token_id,
             "up_price": market.up_price,
@@ -197,9 +209,14 @@ class SnapshotRecorder:
     def _emit_settlement(self, state: dict):
         opening_price = float(state.get("opening_price", 0) or 0)
         final_price = float(state.get("last_price", 0) or 0)
+        official_opening_price = float(state.get("official_opening_price", 0) or 0)
+        official_final_price = float(state.get("official_current_price", 0) or 0)
         settle_side = ""
         if opening_price > 0 and final_price > 0:
             settle_side = "UP" if final_price >= opening_price else "DOWN"
+        official_settle_side = ""
+        if official_opening_price > 0 and official_final_price > 0:
+            official_settle_side = "UP" if official_final_price >= official_opening_price else "DOWN"
 
         row = {
             "symbol": state["symbol"],
@@ -208,6 +225,9 @@ class SnapshotRecorder:
             "opening_price": opening_price,
             "final_price": final_price,
             "settle_side": settle_side,
+            "official_opening_price": official_opening_price,
+            "official_final_price": official_final_price,
+            "official_settle_side": official_settle_side,
             "last_tick_ts": state.get("last_tick_ts", 0),
             "end_time": state.get("end_time", 0),
             "recorded_at": time.time(),

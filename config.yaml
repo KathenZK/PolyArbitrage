@@ -1,10 +1,14 @@
 strategy:
   symbols: ["btcusdt", "ethusdt", "solusdt"]
 
-  # Signal: trigger when Binance price deviates from 15-min opening price
+  # Signal: trade the official Polymarket event, not raw Binance spot
   edge_threshold_pct: 0.003        # 0.3% minimum deviation to generate a signal
   min_secs_remaining: 30           # skip markets with < 30s left
   min_secs_elapsed: 30             # wait 30s after window opens before trading
+  require_official_source: true    # require official Polymarket/Chainlink anchor before trading
+  official_max_age_sec: 90         # skip if official anchor is too stale
+  max_source_divergence_pct: 0.0025
+  source_gap_penalty_mult: 8.0
 
   # Probability model: annualized volatility per asset (for p estimation)
   annual_vol_btcusdt: 0.60
@@ -30,6 +34,7 @@ strategy:
 
   # Market registry
   registry_refresh_sec: 15
+  official_refresh_sec: 60
 
 risk:
   dry_run: true

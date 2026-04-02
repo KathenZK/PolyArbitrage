@@ -1,15 +1,14 @@
-"""Market registry: slug-based discovery of Polymarket 15-min crypto markets.
+"""Market registry: discover Polymarket crypto windows and keep price anchors.
 
-Uses the deterministic slug pattern {asset}-updown-15m-{window_start} to
-directly fetch active markets.
+Two reference layers are tracked per market:
+  - fast source: Binance ticks, used for sub-second movement
+  - official source: Polymarket event metadata derived from Chainlink, used as
+    the settlement anchor (`priceToBeat`) and current official price snapshot
 
 Opening price tracking:
-  - Buffers recent Binance ticks per symbol (last 30 seconds)
-  - On window change: pre-fetches the new market BEFORE ticks arrive
-  - When the market object is ready, picks the tick closest to eventStartTime
-    from the buffer (using tick timestamps, not local clock)
-  - Falls back: if no buffered tick within 5s of window start, waits for the
-    next live tick (but only within 15s of window start)
+  - buffers recent Binance ticks per symbol (last ``TICK_BUFFER_SECS`` seconds)
+  - on window change, reuses the tick closest to the window start
+  - pre-fetches the next window's Gamma payload near the boundary
 """
 
 from __future__ import annotations
@@ -20,7 +19,7 @@ import logging
 import time
 from collections import deque
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 
 import aiohttp
 
@@ -48,9 +47,6 @@ ASSETS: dict[str, str] = {
     "xrp": "xrpusdt",
 }
 
-BINANCE_TO_ASSET: dict[str, str] = {v: k for k, v in ASSETS.items()}
-
-
 @dataclass
 class CryptoMarket:
     market_id: str
@@ -70,9 +66,15 @@ class CryptoMarket:
     volume: float = 0.0
     liquidity: float = 0.0
     spread: float = 0.0
+    resolution_source: str = ""
+    description: str = ""
     fees_enabled: bool = True
     fee_rate: float = 0.072
     order_min_size: int = 5
+    official_opening_price: float = 0.0
+    official_current_price: float = 0.0
+    official_binance_ref_price: float = 0.0
+    official_price_updated_at: float = 0.0
 
     @property
     def secs_remaining(self) -> float:
@@ -85,6 +87,28 @@ class CryptoMarket:
     @property
     def has_opening_price(self) -> bool:
         return self.opening_price > 0
+
+    @property
+    def has_official_opening_price(self) -> bool:
+        return self.official_opening_price > 0
+
+    @property
+    def has_official_current_price(self) -> bool:
+        return self.official_current_price > 0
+
+    @property
+    def has_official_calibration(self) -> bool:
+        return (
+            self.official_opening_price > 0
+            and self.official_current_price > 0
+            and self.official_binance_ref_price > 0
+        )
+
+    @property
+    def official_price_age(self) -> float:
+        if self.official_price_updated_at <= 0:
+            return float("inf")
+        return max(0.0, time.time() - self.official_price_updated_at)
 
     def taker_fee(self, shares: float, price: float) -> float:
         if not self.fees_enabled:
@@ -100,17 +124,20 @@ class MarketRegistry:
         gamma: PolymarketGammaClient,
         assets: list[str] | None = None,
         refresh_interval: float = 15,
+        official_refresh_interval: float = 60,
         min_liquidity: float = 1000,
     ):
         self._gamma = gamma
         self._assets = assets or ["btc", "eth", "sol"]
         self._refresh_interval = refresh_interval
+        self._official_refresh_interval = official_refresh_interval
         self._min_liquidity = min_liquidity
         self._markets: dict[str, CryptoMarket] = {}
         self._running = False
         self._current_window: int = 0
         self._tick_buffer: dict[str, deque[tuple[float, float]]] = {}
         self._on_window_change: list = []
+        self._prefetched_events: dict[str, dict] = {}
 
     @property
     def markets(self) -> dict[str, CryptoMarket]:
@@ -133,8 +160,12 @@ class MarketRegistry:
     def buffer_tick(self, binance_symbol: str, price: float, tick_ts: float):
         """Buffer a Binance tick for opening price recovery. Called on every tick."""
         if binance_symbol not in self._tick_buffer:
-            self._tick_buffer[binance_symbol] = deque(maxlen=500)
-        self._tick_buffer[binance_symbol].append((tick_ts, price))
+            self._tick_buffer[binance_symbol] = deque()
+        buf = self._tick_buffer[binance_symbol]
+        buf.append((tick_ts, price))
+        cutoff = tick_ts - TICK_BUFFER_SECS
+        while buf and buf[0][0] < cutoff:
+            buf.popleft()
 
     def record_opening_price(self, binance_symbol: str, price: float, tick_ts: float):
         """Try to set the opening price from a live tick or the buffer."""
@@ -160,7 +191,7 @@ class MarketRegistry:
             logger.info(f"Opening price: {sym} = ${price:,.2f} (live tick {age:.1f}s into window)")
 
     def _find_best_opening_tick(self, binance_symbol: str, event_start: int) -> tuple[float, float]:
-        """Find the buffered tick closest to (and not before) the window start."""
+        """Find the buffered tick closest to the window start, allowing 1s early skew."""
         buf = self._tick_buffer.get(binance_symbol)
         if not buf:
             return 0.0, 0.0
@@ -178,6 +209,35 @@ class MarketRegistry:
 
         return best_price, best_ts
 
+    def _latest_buffered_price(self, binance_symbol: str) -> float:
+        buf = self._tick_buffer.get(binance_symbol)
+        if not buf:
+            return 0.0
+        return float(buf[-1][1] or 0.0)
+
+    async def _refresh_official_metadata(self, market: CryptoMarket):
+        try:
+            metadata = await asyncio.wait_for(
+                self._gamma.get_event_page_metadata(market.slug),
+                timeout=12,
+            )
+        except Exception as exc:
+            logger.debug(f"Official metadata fetch failed for {market.slug}: {exc}")
+            return
+
+        opening = float(metadata.get("official_opening_price", 0) or 0)
+        current = float(metadata.get("official_current_price", 0) or 0)
+        if opening > 0:
+            market.official_opening_price = opening
+        if current > 0:
+            market.official_current_price = current
+        if opening > 0 or current > 0:
+            market.official_price_updated_at = float(metadata.get("fetched_at", time.time()) or time.time())
+
+        latest_binance = self._latest_buffered_price(market.binance_symbol)
+        if latest_binance > 0:
+            market.official_binance_ref_price = latest_binance
+
     async def refresh(self):
         ws = current_window_start()
         new_window = ws != self._current_window
@@ -194,9 +254,11 @@ class MarketRegistry:
             slug = f"{asset_key}-updown-15m-{ws}"
 
             try:
-                event_data = await asyncio.wait_for(
-                    self._fetch_event_by_slug(slug), timeout=8
-                )
+                event_data = self._prefetched_events.pop(slug, None)
+                if event_data is None:
+                    event_data = await asyncio.wait_for(
+                        self._fetch_event_by_slug(slug), timeout=8
+                    )
                 if not event_data:
                     continue
 
@@ -205,8 +267,13 @@ class MarketRegistry:
                     continue
 
                 old = self._markets.get(binance_sym)
-                if old and old.event_start == ws and old.has_opening_price:
-                    market.opening_price = old.opening_price
+                if old and old.event_start == ws:
+                    if old.has_opening_price:
+                        market.opening_price = old.opening_price
+                    market.official_opening_price = old.official_opening_price
+                    market.official_current_price = old.official_current_price
+                    market.official_binance_ref_price = old.official_binance_ref_price
+                    market.official_price_updated_at = old.official_price_updated_at
 
                 self._markets[binance_sym] = market
 
@@ -220,6 +287,13 @@ class MarketRegistry:
                             f"${best_p:,.2f} ({delta:+.1f}s from window start)"
                         )
 
+                if (
+                    market.official_price_age >= self._official_refresh_interval
+                    or not market.has_official_opening_price
+                    or not market.has_official_current_price
+                ):
+                    await self._refresh_official_metadata(market)
+
             except asyncio.TimeoutError:
                 logger.warning(f"Timeout fetching {slug}")
             except Exception as e:
@@ -232,8 +306,9 @@ class MarketRegistry:
             parts = []
             for m in active:
                 sym = m.asset.upper()
-                op = f"${m.opening_price:,.2f}" if m.has_opening_price else "?"
-                parts.append(f"{sym}(open={op})")
+                fast_open = f"${m.opening_price:,.2f}" if m.has_opening_price else "?"
+                official_open = f"${m.official_opening_price:,.2f}" if m.has_official_opening_price else "?"
+                parts.append(f"{sym}(bin={fast_open}, off={official_open})")
             logger.info(f"Registry: {', '.join(parts)}")
 
     async def _pre_fetch_next_window(self):
@@ -242,7 +317,9 @@ class MarketRegistry:
         for asset_key in self._assets:
             slug = f"{asset_key}-updown-15m-{nws}"
             try:
-                await asyncio.wait_for(self._fetch_event_by_slug(slug), timeout=5)
+                event_data = await asyncio.wait_for(self._fetch_event_by_slug(slug), timeout=5)
+                if event_data:
+                    self._prefetched_events[slug] = event_data
             except Exception:
                 pass
 
@@ -307,6 +384,7 @@ class MarketRegistry:
         return CryptoMarket(
             market_id=str(m.get("id", "")),
             question=m.get("question", ""),
+            description=m.get("description", "") or event.get("description", ""),
             slug=event.get("slug", ""),
             asset=asset,
             binance_symbol=binance_sym,
@@ -321,6 +399,7 @@ class MarketRegistry:
             volume=float(m.get("volume", 0) or 0),
             liquidity=float(m.get("liquidity", 0) or 0),
             spread=float(m.get("spread", 0) or 0),
+            resolution_source=m.get("resolutionSource", "") or event.get("resolutionSource", ""),
             fees_enabled=bool(m.get("feesEnabled", True)),
             fee_rate=fee_sched.get("rate", 0.072) if fee_sched else 0.072,
             order_min_size=int(m.get("orderMinSize", 5) or 5),

@@ -4,7 +4,7 @@ import sys
 import types
 import unittest
 
-from src.data.polymarket_client import PolymarketCLOBClient
+from src.data.polymarket_client import PolymarketCLOBClient, PolymarketGammaClient
 
 
 class LevelObj:
@@ -20,6 +20,22 @@ class BookObj:
 
 
 class PolymarketClientTests(unittest.TestCase):
+    def test_event_page_metadata_parser_extracts_price_to_beat(self):
+        html = """
+        <html><body>
+        <script id="__NEXT_DATA__" type="application/json">
+        {"props":{"pageProps":{"data":[
+            {"slug":"btc-updown-15m-123","eventMetadata":{"finalPrice":66524.33736,"priceToBeat":66569.02175162079}},
+            {"slug":"btc-updown-15m-456","eventMetadata":{"finalPrice":70000.0,"priceToBeat":69950.0}}
+        ]}}}
+        </script>
+        </body></html>
+        """
+        metadata = PolymarketGammaClient._parse_event_page_metadata("btc-updown-15m-123", html)
+        self.assertAlmostEqual(metadata["official_current_price"], 66524.33736, places=6)
+        self.assertAlmostEqual(metadata["official_opening_price"], 66569.02175162079, places=6)
+        self.assertGreater(metadata["fetched_at"], 0)
+
     def test_orderbook_helpers_support_sdk_objects(self):
         client = PolymarketCLOBClient("test-key")
         client.get_orderbook = lambda token_id: BookObj(

@@ -114,6 +114,18 @@ class FillEstimate:
 
 
 @dataclass
+class LivePreflight:
+    ok: bool
+    signer_address: str
+    funder_address: str
+    signature_type: int
+    collateral_balance: float
+    max_allowance: float
+    issues: list[str]
+    warnings: list[str]
+
+
+@dataclass
 class TradePlan:
     signal: Signal
     market: CryptoMarket
@@ -426,8 +438,11 @@ class Executor:
                     continue
                 weighted_ratios.append((weight, fill_ratio))
 
-            if weighted_ratios:
+            if weighted_ratios and len(weighted_ratios) >= self._fill_min_samples:
                 source = "decayed_history"
+            elif weighted_ratios:
+                weighted_ratios = []
+                source = "heuristic_insufficient_samples"
 
         sample_weight_sum = sum(weight for weight, _ in weighted_ratios)
         sample_weight_sq_sum = sum(weight * weight for weight, _ in weighted_ratios)
@@ -466,6 +481,82 @@ class Executor:
         )
         self._fill_stats_cache[cache_key] = (now, estimate)
         return estimate
+
+    @staticmethod
+    def _parse_usdc_amount(value: Any) -> float:
+        try:
+            raw = float(value or 0)
+        except (TypeError, ValueError):
+            return 0.0
+        if raw > 1000:
+            return raw / 1_000_000.0
+        return raw
+
+    def live_preflight(self) -> LivePreflight:
+        issues: list[str] = []
+        warnings: list[str] = []
+
+        signature_type_raw = os.getenv("POLYMARKET_SIGNATURE_TYPE", "0").strip() or "0"
+        try:
+            signature_type = int(signature_type_raw)
+        except ValueError:
+            signature_type = -1
+            issues.append(f"Invalid POLYMARKET_SIGNATURE_TYPE={signature_type_raw!r}")
+
+        funder = os.getenv("POLYMARKET_FUNDER", "").strip()
+        signer = ""
+        collateral_balance = 0.0
+        max_allowance = 0.0
+
+        try:
+            clob = self._ensure_clob()
+            signer = str(clob.get_signer_address() or "")
+            raw_balance = clob.get_collateral_balance_allowance(signature_type=signature_type)
+        except Exception as exc:
+            issues.append(f"CLOB preflight failed: {exc}")
+            return LivePreflight(
+                ok=False,
+                signer_address=signer,
+                funder_address=funder,
+                signature_type=signature_type,
+                collateral_balance=collateral_balance,
+                max_allowance=max_allowance,
+                issues=issues,
+                warnings=warnings,
+            )
+
+        balance_value = self._field(raw_balance, "balance", default=0)
+        collateral_balance = self._parse_usdc_amount(balance_value)
+
+        allowances = self._field(raw_balance, "allowances", default={}) or {}
+        if isinstance(allowances, dict):
+            max_allowance = max((self._parse_usdc_amount(v) for v in allowances.values()), default=0.0)
+
+        if signature_type == 0 and signer and funder and signer.lower() != funder.lower():
+            issues.append("EOA mode requires signer and funder to match")
+        if signature_type != 0 and not funder:
+            issues.append("Proxy-wallet mode requires POLYMARKET_FUNDER")
+        if collateral_balance + 1e-9 < self._bet_size:
+            issues.append(
+                f"Insufficient collateral balance (${collateral_balance:.6f}) for bet_size ${self._bet_size:.2f}"
+            )
+        if max_allowance + 1e-9 < self._bet_size:
+            issues.append(
+                f"Insufficient collateral allowance (${max_allowance:.6f}) for bet_size ${self._bet_size:.2f}"
+            )
+        if not signer:
+            warnings.append("Signer address unavailable")
+
+        return LivePreflight(
+            ok=not issues,
+            signer_address=signer,
+            funder_address=funder,
+            signature_type=signature_type,
+            collateral_balance=collateral_balance,
+            max_allowance=max_allowance,
+            issues=issues,
+            warnings=warnings,
+        )
 
     def _normalize_status(self, raw_status: str, expiration_ts: int = 0) -> OrderStatus | None:
         if raw_status in self._FILLED_STATUSES:
