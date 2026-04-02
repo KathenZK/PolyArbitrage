@@ -54,6 +54,7 @@ def seed_trade(conn, *, matched_ratio: float, hours_ago: float):
         side="Up",
         asset="BTC",
         market_id="m1",
+        condition_id="0xcond1",
         market_slug="btc-updown-15m-123",
         token_id="token-up",
         price=0.61,

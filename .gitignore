@@ -15,3 +15,4 @@ data/recordings/*_replay_summary.json
 .DS_Store
 *.pem
 *.key
+*.pub

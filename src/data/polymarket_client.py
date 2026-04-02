@@ -80,6 +80,30 @@ class PolymarketGammaClient:
         }
         return await self._get("/events", params)
 
+    async def get_positions(
+        self,
+        user: str,
+        *,
+        redeemable: bool | None = None,
+        limit: int = 500,
+        offset: int = 0,
+    ) -> list[dict]:
+        params: dict[str, Any] = {
+            "user": user,
+            "limit": limit,
+            "offset": offset,
+        }
+        if redeemable is not None:
+            params["redeemable"] = str(redeemable).lower()
+        session = await self._ensure_session()
+        async with session.get(
+            "https://data-api.polymarket.com/positions",
+            params=params,
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as r:
+            r.raise_for_status()
+            return await r.json()
+
     async def check_geoblock(self) -> dict:
         """Check if the current IP is blocked from trading."""
         session = await self._ensure_session()
@@ -219,6 +243,14 @@ class PolymarketCLOBClient:
             signature_type=self._signature_type if signature_type is None else signature_type,
         )
         return client.get_balance_allowance(params)
+
+    def get_collateral_address(self) -> str:
+        client = self._ensure_client()
+        return str(client.get_collateral_address())
+
+    def get_market(self, condition_id: str) -> Any:
+        client = self._ensure_client()
+        return client.get_market(condition_id)
 
     @staticmethod
     def _read_level_value(level: Any, field: str) -> float:

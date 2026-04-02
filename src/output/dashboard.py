@@ -167,6 +167,13 @@ def build_status_panel(pipeline: Pipeline) -> Panel:
     text.append(f" Filled:   {pipeline.executor.trade_count:>10}\n")
     text.append(f" Filled$:  ${pipeline.executor.total_cost:>9,.2f}\n")
     text.append(f" Commit$:  ${pipeline.executor.total_committed:>9,.2f}\n")
+    redeem_status = pipeline.redeemer.status()
+    text.append(" Redeem:   ", style="bold")
+    if redeem_status.armed:
+        text.append("armed", style="green")
+    else:
+        text.append("off", style="yellow")
+    text.append("\n")
     text.append(" Mode:     ", style="bold")
     if pipeline.config.get("risk", {}).get("dry_run", True):
         text.append("PAPER", style="bold yellow")

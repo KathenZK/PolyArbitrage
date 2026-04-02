@@ -71,6 +71,7 @@ class CryptoMarket:
     fees_enabled: bool = True
     fee_rate: float = 0.072
     order_min_size: int = 5
+    condition_id: str = ""
     official_opening_price: float = 0.0
     official_current_price: float = 0.0
     official_binance_ref_price: float = 0.0
@@ -406,6 +407,7 @@ class MarketRegistry:
             slug=event.get("slug", ""),
             asset=asset,
             binance_symbol=binance_sym,
+            condition_id=str(m.get("conditionId", "") or ""),
             up_token_id=tokens[0],
             down_token_id=tokens[1],
             up_price=prices[0] if prices else 0.5,

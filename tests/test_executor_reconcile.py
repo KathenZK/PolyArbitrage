@@ -137,6 +137,7 @@ class ExecutorReconcileTests(unittest.TestCase):
             side="Up",
             asset="BTC",
             market_id="seed-market",
+            condition_id="0xseedcond",
             market_slug="seed-market",
             token_id="seed-token",
             price=0.61,

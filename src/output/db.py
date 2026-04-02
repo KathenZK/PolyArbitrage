@@ -14,6 +14,7 @@ DB_PATH = Path(__file__).resolve().parent.parent.parent / "data" / "polyarbitrag
 TRADE_COLUMNS: dict[str, str] = {
     "updated_at": "REAL NOT NULL DEFAULT 0",
     "asset": "TEXT NOT NULL DEFAULT ''",
+    "condition_id": "TEXT DEFAULT ''",
     "market_slug": "TEXT DEFAULT ''",
     "order_id": "TEXT DEFAULT ''",
     "matched_size": "REAL NOT NULL DEFAULT 0",
@@ -32,6 +33,17 @@ TRADE_COLUMNS: dict[str, str] = {
     "liquidity_at_submit": "REAL NOT NULL DEFAULT 0",
     "spread_at_submit": "REAL NOT NULL DEFAULT 0",
     "queue_ticks_at_submit": "REAL NOT NULL DEFAULT 0",
+    "last_error": "TEXT DEFAULT ''",
+    "raw_json": "TEXT DEFAULT '{}'",
+}
+
+REDEEM_COLUMNS: dict[str, str] = {
+    "market_slug": "TEXT DEFAULT ''",
+    "proxy_wallet": "TEXT DEFAULT ''",
+    "outcome": "TEXT DEFAULT ''",
+    "size": "REAL NOT NULL DEFAULT 0",
+    "transaction_id": "TEXT DEFAULT ''",
+    "transaction_hash": "TEXT DEFAULT ''",
     "last_error": "TEXT DEFAULT ''",
     "raw_json": "TEXT DEFAULT '{}'",
 }
@@ -59,6 +71,13 @@ def _ensure_trade_columns(conn: sqlite3.Connection):
             conn.execute(f"ALTER TABLE trades ADD COLUMN {name} {ddl}")
 
 
+def _ensure_redeem_columns(conn: sqlite3.Connection):
+    existing = _column_names(conn, "redeems")
+    for name, ddl in REDEEM_COLUMNS.items():
+        if name not in existing:
+            conn.execute(f"ALTER TABLE redeems ADD COLUMN {name} {ddl}")
+
+
 def init_db(conn: sqlite3.Connection):
     conn.executescript(
         """
@@ -79,14 +98,27 @@ def init_db(conn: sqlite3.Connection):
             pnl                 REAL DEFAULT 0.0,
             resolved_at         REAL
         );
+
+        CREATE TABLE IF NOT EXISTS redeems (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at          REAL NOT NULL,
+            updated_at          REAL NOT NULL,
+            condition_id        TEXT NOT NULL,
+            asset               TEXT NOT NULL DEFAULT '',
+            status              TEXT NOT NULL DEFAULT 'redeemable'
+        );
         """
     )
     _ensure_trade_columns(conn)
+    _ensure_redeem_columns(conn)
     conn.executescript(
         """
         CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status);
         CREATE INDEX IF NOT EXISTS idx_trades_order_id ON trades(order_id);
         CREATE INDEX IF NOT EXISTS idx_trades_timestamp ON trades(timestamp);
+        CREATE INDEX IF NOT EXISTS idx_trades_condition_id ON trades(condition_id);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_redeems_condition_id ON redeems(condition_id);
+        CREATE INDEX IF NOT EXISTS idx_redeems_status ON redeems(status);
         """
     )
     conn.execute(
@@ -108,6 +140,7 @@ def insert_trade(
     asset: str,
     market_id: str,
     market_slug: str,
+    condition_id: str,
     token_id: str,
     price: float,
     size: float,
@@ -139,14 +172,14 @@ def insert_trade(
         """
         INSERT INTO trades (
             timestamp, updated_at, strategy, event_title, action, side, asset,
-            market_id, market_slug, token_id, order_id, price, size,
+            market_id, condition_id, market_slug, token_id, order_id, price, size,
             matched_size, cost_usd, matched_cost_usd, is_paper, status,
             win_prob, fill_prob, fill_lower_bound, fill_confidence,
             fill_effective_samples, fill_source, filled_ev_usd, expected_value_usd,
             taker_fee_avoided, expiration_ts, secs_remaining_at_submit,
             liquidity_at_submit, spread_at_submit, queue_ticks_at_submit,
             last_error, raw_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             now,
@@ -157,6 +190,7 @@ def insert_trade(
             side,
             asset,
             market_id,
+            condition_id,
             market_slug,
             token_id,
             order_id,
@@ -240,6 +274,134 @@ def get_pending_trades(conn: sqlite3.Connection) -> list[dict[str, Any]]:
         """
     ).fetchall()
     return [dict(row) for row in rows]
+
+
+def get_tracked_live_condition_ids(conn: sqlite3.Connection) -> set[str]:
+    rows = conn.execute(
+        """
+        SELECT DISTINCT condition_id
+        FROM trades
+        WHERE is_paper=0
+          AND condition_id <> ''
+        """
+    ).fetchall()
+    return {str(row["condition_id"]) for row in rows if row["condition_id"]}
+
+
+def upsert_redeem_candidate(
+    conn: sqlite3.Connection,
+    *,
+    condition_id: str,
+    asset: str,
+    market_slug: str,
+    proxy_wallet: str,
+    outcome: str,
+    size: float,
+    status: str = "redeemable",
+    raw_data: Any | None = None,
+) -> int:
+    existing = conn.execute(
+        "SELECT id, status FROM redeems WHERE condition_id=?",
+        (condition_id,),
+    ).fetchone()
+    now = time.time()
+    if existing is None:
+        cur = conn.execute(
+            """
+            INSERT INTO redeems (
+                created_at, updated_at, condition_id, asset, market_slug,
+                proxy_wallet, outcome, size, status, raw_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                now,
+                now,
+                condition_id,
+                asset,
+                market_slug,
+                proxy_wallet,
+                outcome,
+                size,
+                status,
+                json.dumps(raw_data or {}),
+            ),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+
+    redeem_id = int(existing["id"])
+    fields = [
+        "updated_at=?",
+        "asset=?",
+        "market_slug=?",
+        "proxy_wallet=?",
+        "outcome=?",
+        "size=?",
+        "raw_json=?",
+    ]
+    values: list[Any] = [
+        now,
+        asset,
+        market_slug,
+        proxy_wallet,
+        outcome,
+        size,
+        json.dumps(raw_data or {}),
+    ]
+    current_status = str(existing["status"] or "")
+    if current_status not in {"submitted", "confirmed"}:
+        fields.append("status=?")
+        values.append(status)
+    values.append(redeem_id)
+    conn.execute(f"UPDATE redeems SET {', '.join(fields)} WHERE id=?", values)
+    conn.commit()
+    return redeem_id
+
+
+def get_pending_redeems(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT *
+        FROM redeems
+        WHERE status IN ('redeemable', 'retry', 'submitted')
+        ORDER BY created_at ASC
+        """
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def update_redeem(
+    conn: sqlite3.Connection,
+    redeem_id: int,
+    *,
+    status: str | None = None,
+    transaction_id: str | None = None,
+    transaction_hash: str | None = None,
+    last_error: str | None = None,
+    raw_data: Any | None = None,
+):
+    fields = ["updated_at=?"]
+    values: list[Any] = [time.time()]
+
+    if status is not None:
+        fields.append("status=?")
+        values.append(status)
+    if transaction_id is not None:
+        fields.append("transaction_id=?")
+        values.append(transaction_id)
+    if transaction_hash is not None:
+        fields.append("transaction_hash=?")
+        values.append(transaction_hash)
+    if last_error is not None:
+        fields.append("last_error=?")
+        values.append(last_error)
+    if raw_data is not None:
+        fields.append("raw_json=?")
+        values.append(json.dumps(raw_data))
+
+    values.append(redeem_id)
+    conn.execute(f"UPDATE redeems SET {', '.join(fields)} WHERE id=?", values)
+    conn.commit()
 
 
 def get_fill_rate_stats(

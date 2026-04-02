@@ -637,6 +637,7 @@ class Executor:
                 side=trade.token_side,
                 asset=trade.asset,
                 market_id=trade.market.market_id if trade.market else "",
+                condition_id=trade.market.condition_id if trade.market else "",
                 market_slug=trade.market.slug if trade.market else "",
                 token_id=trade.token_id,
                 price=trade.price,

@@ -15,10 +15,21 @@ class DingTalkAlert:
     def __init__(self, webhook_url: str = "", keyword: str = "PolyGod"):
         self._url = webhook_url or os.getenv("DINGTALK_WEBHOOK", "")
         self._keyword = keyword
+        self._session: aiohttp.ClientSession | None = None
 
     @property
     def enabled(self) -> bool:
         return bool(self._url)
+
+    async def _ensure_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession()
+        return self._session
+
+    async def close(self):
+        if self._session and not self._session.closed:
+            await self._session.close()
+            self._session = None
 
     async def send_text(self, content: str):
         if not self._url:
@@ -91,16 +102,56 @@ class DingTalkAlert:
         )
         await self.send_markdown(f"策略启动 {mode_cn}", text)
 
+    async def send_heartbeat(
+        self,
+        *,
+        uptime_secs: float,
+        ticks: int,
+        signals: int,
+        guards_passed: int,
+        trades_filled: int,
+        trades_pending: int,
+        skipped_liq: int,
+        skipped_edge: int,
+        skipped_ev: int,
+        skipped_live: int,
+        total_cost: float,
+        markets_active: int,
+        mode: str,
+    ):
+        h, rem = divmod(int(uptime_secs), 3600)
+        m, s = divmod(rem, 60)
+        mode_cn = "模拟" if mode == "PAPER" else "实盘"
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        text = (
+            f"**{self._keyword}** 💓 **状态报告**\n\n"
+            f"- 时间：{ts}\n"
+            f"- 运行：{h}h{m:02d}m{s:02d}s\n"
+            f"- 模式：**{mode_cn}**\n"
+            f"- 市场：{markets_active} 个活跃\n"
+            f"- Tick：{ticks:,}\n"
+            f"- 信号：{signals}\n"
+            f"- 通过Guard：{guards_passed}\n"
+            f"- 跳过（流动性）：{skipped_liq}\n"
+            f"- 跳过（无edge）：{skipped_edge}\n"
+            f"- 跳过（EV低）：{skipped_ev}\n"
+            f"- 跳过（日限额）：{skipped_live}\n"
+            f"- 已成交：{trades_filled}\n"
+            f"- 挂单中：{trades_pending}\n"
+            f"- 累计金额：${total_cost:,.2f}\n"
+        )
+        await self.send_markdown(f"状态报告 {mode_cn}", text)
+
     async def _post(self, body: dict):
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    self._url,
-                    json=body,
-                    timeout=aiohttp.ClientTimeout(total=10),
-                ) as resp:
-                    result = await resp.json()
-                    if result.get("errcode") != 0:
-                        logger.warning(f"DingTalk error: {result}")
+            session = await self._ensure_session()
+            async with session.post(
+                self._url,
+                json=body,
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                result = await resp.json()
+                if result.get("errcode") != 0:
+                    logger.warning(f"DingTalk error: {result}")
         except Exception as e:
             logger.warning(f"DingTalk send failed: {e}")

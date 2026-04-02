@@ -175,6 +175,7 @@ class SnapshotRecorder:
             "official_binance_ref_ts": market.official_binance_ref_ts,
             "deviation_pct": deviation,
             "market_id": market.market_id,
+            "condition_id": market.condition_id,
             "market_slug": market.slug,
             "question": market.question,
             "description": market.description,

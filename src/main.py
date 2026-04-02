@@ -32,6 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.data.binance_stream import BinanceStream, Tick
 from src.data.market_registry import MarketRegistry
 from src.data.polymarket_client import PolymarketGammaClient
+from src.execution.redeemer import ProxyRedeemer
 from src.output.alerts import DingTalkAlert
 from src.output.db import get_connection, init_db
 from src.output.dashboard import build_dashboard
@@ -102,6 +103,14 @@ class Pipeline:
             fill_lower_bound_z=strat.get("fill_lower_bound_z", 1.0),
             max_live_orders_per_day=config.get("risk", {}).get("max_live_orders_per_day", 0),
             max_live_notional_usd_per_day=config.get("risk", {}).get("max_live_notional_usd_per_day", 0.0),
+        )
+        redeem_cfg = config.get("redeem", {})
+        self.redeemer = ProxyRedeemer(
+            self.gamma,
+            enabled=redeem_cfg.get("enabled", True),
+            poll_interval_secs=redeem_cfg.get("poll_interval_sec", 180),
+            tracked_strategy_only=redeem_cfg.get("tracked_strategy_only", True),
+            require_auth=redeem_cfg.get("require_auth", True),
         )
 
         self.registry.register_window_change_callback(self.guard.on_window_change)
@@ -175,6 +184,43 @@ class Pipeline:
                 logger.error(f"Reconcile error: {e}")
             await asyncio.sleep(1.0)
 
+    async def _redeem_loop(self):
+        while True:
+            try:
+                await self.redeemer.run_once()
+            except Exception as e:
+                logger.error(f"Redeem loop error: {e}")
+            await asyncio.sleep(self.redeemer.poll_interval)
+
+    async def _heartbeat_loop(self):
+        interval = self.config.get("alerts", {}).get("heartbeat_interval_sec", 3600)
+        if interval <= 0:
+            return
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                await self._send_heartbeat()
+            except Exception as e:
+                logger.warning(f"Heartbeat send failed: {e}")
+
+    async def _send_heartbeat(self):
+        dry_run = self.config.get("risk", {}).get("dry_run", True)
+        await self.alerts.send_heartbeat(
+            uptime_secs=time.time() - self.start_time if self.start_time > 0 else 0,
+            ticks=self.ticks_count,
+            signals=self.signals_count,
+            guards_passed=self.guards_passed,
+            trades_filled=self.executor.trade_count,
+            trades_pending=self.executor.pending_count,
+            skipped_liq=self.executor.skipped_low_liq,
+            skipped_edge=self.executor.skipped_no_edge,
+            skipped_ev=self.executor.skipped_low_ev,
+            skipped_live=self.executor.skipped_live_limits,
+            total_cost=self.executor.total_cost,
+            markets_active=self.registry.market_count,
+            mode="PAPER" if dry_run else "LIVE",
+        )
+
     async def _check_geoblock(self):
         try:
             geo = await self.gamma.check_geoblock()
@@ -218,6 +264,11 @@ class Pipeline:
         console.print(f"  Allow:   {allowance_text}")
         for warning in report.warnings:
             console.print(f"  Warn:    {warning}")
+        redeem_status = self.redeemer.status()
+        if redeem_status.armed:
+            console.print("  Redeem:  armed")
+        else:
+            console.print(f"  Redeem:  disabled ({redeem_status.reason})")
         return True
 
     async def run(self):
@@ -241,14 +292,18 @@ class Pipeline:
         self._db_conn = get_connection()
         init_db(self._db_conn)
         self.executor.attach_db(self._db_conn)
+        self.redeemer.attach_db(self._db_conn)
 
         registry_task = asyncio.create_task(self.registry.run())
         await self.registry.refresh()
         self.executor.bootstrap_pending_orders()
         await self.executor.reconcile_pending_orders(force=True)
+        self.redeemer.attach_clob(self.executor._clob)
 
         stream_task = asyncio.create_task(self.stream.run())
         reconcile_task = asyncio.create_task(self._reconcile_loop())
+        redeem_task = asyncio.create_task(self._redeem_loop()) if not dry_run else None
+        heartbeat_task = asyncio.create_task(self._heartbeat_loop())
 
         await self.alerts.send_startup(
             mode="PAPER" if dry_run else "LIVE",
@@ -266,10 +321,16 @@ class Pipeline:
             registry_task.cancel()
             stream_task.cancel()
             reconcile_task.cancel()
+            if redeem_task is not None:
+                redeem_task.cancel()
+            heartbeat_task.cancel()
 
     async def run_headless(self):
+        dry_run = self.config.get("risk", {}).get("dry_run", True)
+        symbols = self.config.get("strategy", {}).get("symbols", ["btcusdt"])
         self.start_time = time.time()
-        if not self.config.get("risk", {}).get("dry_run", True):
+
+        if not dry_run:
             if not await self._run_live_preflight():
                 logger.error("Live preflight failed")
                 return
@@ -278,22 +339,38 @@ class Pipeline:
         self._db_conn = get_connection()
         init_db(self._db_conn)
         self.executor.attach_db(self._db_conn)
+        self.redeemer.attach_db(self._db_conn)
 
         registry_task = asyncio.create_task(self.registry.run())
         await self.registry.refresh()
         self.executor.bootstrap_pending_orders()
         await self.executor.reconcile_pending_orders(force=True)
+        self.redeemer.attach_clob(self.executor._clob)
         reconcile_task = asyncio.create_task(self._reconcile_loop())
+        redeem_task = asyncio.create_task(self._redeem_loop()) if not dry_run else None
+        heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+
+        await self.alerts.send_startup(
+            mode="PAPER" if dry_run else "LIVE",
+            symbols=[s.replace("usdt", "").upper() for s in symbols],
+        )
 
         try:
             await self.stream.run()
         finally:
             registry_task.cancel()
             reconcile_task.cancel()
+            if redeem_task is not None:
+                redeem_task.cancel()
+            heartbeat_task.cancel()
+            if self._db_conn is not None:
+                self._db_conn.close()
+                self._db_conn = None
 
     async def shutdown(self):
         self.stream.stop()
         self.registry.stop()
+        await self.alerts.close()
         await self.gamma.close()
         if self._db_conn is not None:
             self._db_conn.close()

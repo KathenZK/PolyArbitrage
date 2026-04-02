@@ -131,6 +131,7 @@ def _build_market(row: dict[str, Any]) -> CryptoMarket:
         fees_enabled=bool(row.get("fees_enabled", True)),
         fee_rate=_parse_float(row, "fee_rate", 0.072),
         order_min_size=_parse_int(row, "order_min_size", 5),
+        condition_id=str(row.get("condition_id") or row.get("conditionId") or ""),
         official_opening_price=_parse_float(row, "official_opening_price", 0.0),
         official_current_price=_parse_float(row, "official_current_price", 0.0),
         official_binance_ref_price=_parse_float(row, "official_binance_ref_price", 0.0),
