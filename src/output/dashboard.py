@@ -48,6 +48,24 @@ def _trunc(s: str, n: int = 50) -> str:
     return s[: n - 2] + ".." if len(s) > n else s
 
 
+def _market_source_text(market) -> Text:
+    if market.has_official_calibration and market.official_calibration_age < 90:
+        return Text("双源", style="green")
+    if market.has_official_opening_price and market.has_opening_price:
+        return Text("锚定降级", style="yellow")
+    if market.has_opening_price:
+        return Text("币安", style="dim")
+    return Text("--", style="dim")
+
+
+def _signal_source_label(price_source: str) -> str:
+    if price_source == "dual_calibrated":
+        return "双源"
+    if price_source == "official_anchor_fast_return":
+        return "锚定降级"
+    return "币安"
+
+
 # ---------------------------------------------------------------------------
 # Header
 # ---------------------------------------------------------------------------
@@ -100,10 +118,14 @@ def build_prices_panel(pipeline: Pipeline) -> Panel:
         source_style = "dim"
 
         if market:
-            if market.has_official_calibration and market.official_calibration_age < 90:
-                source_tag = " (官方)"
+            source_label = _market_source_text(market).plain
+            if source_label == "双源":
+                source_tag = " (双源)"
                 source_style = "green"
-            elif market.has_opening_price:
+            elif source_label == "锚定降级":
+                source_tag = " (锚定降级)"
+                source_style = "yellow"
+            elif source_label == "币安":
                 source_tag = " (币安)"
                 source_style = "yellow"
             else:
@@ -146,7 +168,7 @@ def build_markets_table(pipeline: Pipeline) -> Table:
     table.add_column("看跌", width=6, justify="right")
     table.add_column("价差", width=5, justify="right")
     table.add_column("锚定价", width=11, justify="right")
-    table.add_column("源", width=5, justify="center")
+    table.add_column("源", width=10, justify="center")
     table.add_column("剩余", width=8, justify="right")
     table.add_column("流动性", width=9, justify="right")
 
@@ -178,14 +200,7 @@ def build_markets_table(pipeline: Pipeline) -> Table:
             spread_str = "--"
             spread_style = "dim"
 
-        if m.has_official_calibration and m.official_calibration_age < 90:
-            src = Text("Poly", style="green")
-        elif m.has_official_calibration:
-            src = Text("Poly", style="yellow")
-        elif m.has_opening_price:
-            src = Text("币安", style="dim")
-        else:
-            src = Text("--", style="dim")
+        src = _market_source_text(m)
 
         table.add_row(
             sym,
@@ -210,11 +225,11 @@ def build_signals_table(pipeline: Pipeline) -> Table:
     table = Table(title="信号", expand=True, border_style="yellow")
     table.add_column("时间", width=8)
     table.add_column("品种", width=4)
-    table.add_column("来源", width=5)
+    table.add_column("来源", width=10)
     table.add_column("方向", width=5)
     table.add_column("偏差", width=7, justify="right")
     table.add_column("胜率", width=6, justify="right")
-    table.add_column("间距", width=6, justify="right")
+    table.add_column("双源差", width=7, justify="right")
 
     for sig in reversed(pipeline.signals[-12:]):
         ts = datetime.fromtimestamp(sig.timestamp).strftime("%H:%M:%S")
@@ -233,7 +248,7 @@ def build_signals_table(pipeline: Pipeline) -> Table:
         table.add_row(
             ts,
             sig.asset,
-            "双源" if sig.price_source == "dual_calibrated" else "币安",
+            _signal_source_label(sig.price_source),
             Text(
                 _DIR_ZH.get(sig.direction.value, sig.direction.value),
                 style=f"bold {style}",
@@ -252,18 +267,18 @@ def build_signals_table(pipeline: Pipeline) -> Table:
 # ---------------------------------------------------------------------------
 
 def build_trades_table(pipeline: Pipeline) -> Table:
-    table = Table(title="交易", expand=True, border_style="green")
+    table = Table(title="最近交易", expand=True, border_style="green")
     table.add_column("时间", width=8)
-    table.add_column("品种", width=4)
-    table.add_column("方向", width=5)
+    table.add_column("标的", width=4)
+    table.add_column("买哪边", width=6)
     table.add_column("状态", width=10)
-    table.add_column("实成", width=7, justify="right")
-    table.add_column("保守下界", width=8, justify="right")
-    table.add_column("报价", width=5, justify="right")
-    table.add_column("胜率", width=5, justify="right")
-    table.add_column("期望", width=7, justify="right")
-    table.add_column("金额", width=7, justify="right")
-    table.add_column("", width=5)
+    table.add_column("实际成交", width=8, justify="right")
+    table.add_column("保守成交", width=8, justify="right")
+    table.add_column("挂单价", width=6, justify="right")
+    table.add_column("模型胜率", width=8, justify="right")
+    table.add_column("模型期望", width=8, justify="right")
+    table.add_column("成交额", width=7, justify="right")
+    table.add_column("模式", width=5)
 
     now = time.time()
     for t in reversed(pipeline.executor.recent_trades[-12:]):
@@ -433,12 +448,12 @@ def build_stats_panel(pipeline: Pipeline) -> Panel:
 
     t.append(f" 交易: {len(trades)}")
     t.append(f"  已成交: {len(filled)}\n")
-    t.append(" 提交期望: ")
+    t.append(" 提交EV: ")
     t.append(
         f"${total_submitted_ev:+,.2f}",
         style="green" if total_submitted_ev >= 0 else "red",
     )
-    t.append("  匹配期望: ")
+    t.append("  成交EV: ")
     t.append(
         f"${total_matched_ev:+,.2f}\n",
         style="green" if total_matched_ev >= 0 else "red",
@@ -484,6 +499,65 @@ def build_stats_panel(pipeline: Pipeline) -> Panel:
 
 
 # ---------------------------------------------------------------------------
+# Funding
+# ---------------------------------------------------------------------------
+
+def build_funding_panel(pipeline: Pipeline) -> Panel:
+    ex = pipeline.executor
+    positions = ex.open_positions()
+
+    unsettled_cost = ex.open_position_cost_basis
+    buy_matched = ex.total_cost
+    sell_recovered = ex.total_sell_recovered
+    pending_committed = ex.total_committed
+    net_invested = ex.net_cash_invested
+
+    marked_value = 0.0
+    for pos in positions:
+        market = pipeline.registry.get_market(pos.binance_symbol)
+        if market is None:
+            marked_value += pos.available_shares * pos.avg_entry_price
+            continue
+        token_price = market.up_price if pos.direction == "UP" else market.down_price
+        if token_price <= 0:
+            token_price = pos.avg_entry_price
+        marked_value += pos.available_shares * token_price
+
+    unrealized = marked_value - unsettled_cost
+    open_markets = len({pos.market_slug for pos in positions if pos.market_slug})
+
+    t = Text()
+    t.append(" 已买入成交: ")
+    t.append(f"${buy_matched:,.2f}", style="cyan")
+    t.append("  已卖出回收: ")
+    t.append(f"${sell_recovered:,.2f}\n", style="green" if sell_recovered > 0 else "dim")
+
+    t.append(" 未结算成本: ")
+    t.append(f"${unsettled_cost:,.2f}", style="yellow" if unsettled_cost > 0 else "dim")
+    t.append("  未结算估值: ")
+    t.append(
+        f"${marked_value:,.2f}\n",
+        style="green" if marked_value >= unsettled_cost else "red" if marked_value > 0 else "dim",
+    )
+
+    t.append(" 挂单占用: ")
+    t.append(f"${pending_committed:,.2f}", style="yellow" if pending_committed > 0 else "dim")
+    t.append("  净投入: ")
+    t.append(f"${net_invested:,.2f}\n", style="white")
+
+    t.append(" ─── 未结算头寸 ───\n", style="dim")
+    t.append(f" 头寸数: {len(positions)}")
+    t.append(f"  待结算市场: {open_markets}\n")
+    t.append(" 浮动盈亏: ")
+    t.append(
+        f"${unrealized:+,.2f}",
+        style="green" if unrealized >= 0 else "red",
+    )
+
+    return Panel(t, title="资金", border_style="yellow")
+
+
+# ---------------------------------------------------------------------------
 # Dashboard layout
 # ---------------------------------------------------------------------------
 
@@ -513,8 +587,9 @@ def build_dashboard(pipeline: Pipeline) -> Layout:
     layout["trades"].update(build_trades_table(pipeline))
 
     layout["bottom"].split_row(
-        Layout(build_status_panel(pipeline), ratio=1),
-        Layout(build_stats_panel(pipeline), ratio=1),
+        Layout(build_status_panel(pipeline), ratio=5),
+        Layout(build_funding_panel(pipeline), ratio=4),
+        Layout(build_stats_panel(pipeline), ratio=4),
     )
 
     return layout

@@ -312,12 +312,24 @@ class Executor:
         return sum(o.matched_cost_usd for o in self._orders if o.order_side == "BUY")
 
     @property
+    def total_sell_recovered(self) -> float:
+        return sum(o.matched_cost_usd for o in self._orders if o.order_side == "SELL")
+
+    @property
     def total_committed(self) -> float:
         return sum(
             max(0.0, o.cost_usd - o.matched_cost_usd)
             for o in self._orders
             if o.status == OrderStatus.PENDING and o.order_side == "BUY"
         )
+
+    @property
+    def net_cash_invested(self) -> float:
+        return self.total_cost - self.total_sell_recovered
+
+    @property
+    def open_position_cost_basis(self) -> float:
+        return sum(pos.available_shares * pos.avg_entry_price for pos in self.open_positions())
 
     @property
     def skipped_low_liq(self) -> int:
