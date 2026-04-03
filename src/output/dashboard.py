@@ -25,6 +25,7 @@ _STATUS_ZH = {
     "rejected": "已拒绝",
     "expired": "已过期",
 }
+_ORDER_SIDE_ZH = {"BUY": "买", "SELL": "卖"}
 
 _db_cache: dict[str, tuple[float, Any]] = {}
 _DB_CACHE_TTL = 5.0
@@ -305,7 +306,7 @@ def build_trades_table(pipeline: Pipeline) -> Table:
             ts,
             t.asset,
             Text(
-                _SIDE_ZH.get(t.token_side, t.token_side),
+                f"{_ORDER_SIDE_ZH.get(t.order_side, t.order_side)}{_SIDE_ZH.get(t.token_side, t.token_side)}",
                 style=f"bold {dir_style}",
             ),
             Text(status_zh, style=status_style),

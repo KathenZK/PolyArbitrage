@@ -6,6 +6,8 @@ build/
 .venv/
 .env
 data/*.db
+data/*.db-shm
+data/*.db-wal
 data/*.json
 data/recordings/*.pid
 data/recordings/*.jsonl

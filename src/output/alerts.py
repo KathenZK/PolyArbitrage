@@ -55,6 +55,7 @@ class DingTalkAlert:
         self,
         symbol: str,
         direction: str,
+        order_side: str,
         price: float,
         shares: float,
         cost: float,
@@ -67,10 +68,12 @@ class DingTalkAlert:
         ts = datetime.now().strftime("%H:%M:%S")
         arrow = "📈" if direction == "UP" else "📉"
         side = "看涨" if direction == "UP" else "看跌"
+        action_cn = "买入" if order_side.upper() == "BUY" else "卖出"
         text = (
             f"**{self._keyword}** {arrow} **下单通知**\n\n"
             f"> **{side} {symbol}** @ ${price:.3f}\n\n"
-            f"- 方向：{side}（买入 {'Up' if direction == 'UP' else 'Down'} token）\n"
+            f"- 动作：{action_cn} {'Up' if direction == 'UP' else 'Down'} token\n"
+            f"- 方向：{side}\n"
             f"- 价格：${price:.3f}\n"
             f"- 数量：{shares:.1f} 股\n"
             f"- 金额：${cost:.2f}\n"

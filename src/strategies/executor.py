@@ -29,10 +29,11 @@ from src.output.db import (
     get_fill_calibration_rows,
     get_live_daily_usage,
     get_pending_trades,
+    get_position_rows,
     insert_trade,
     update_trade,
 )
-from src.strategies.momentum import Direction, Signal
+from src.strategies.momentum import Direction, MarketEstimate, Signal
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +64,7 @@ class TradeResult:
     cost_usd: float
     matched_cost_usd: float
     order_id: str
+    order_side: str
     is_paper: bool
     timestamp: float
     status: OrderStatus = OrderStatus.PENDING
@@ -124,6 +126,25 @@ class TokenQuote:
     best_ask: float
     spread: float
     tick_size: float
+    source: str = "synthetic"
+    executable_book: bool = False
+
+
+@dataclass
+class OpenPosition:
+    asset: str
+    binance_symbol: str
+    market_id: str
+    condition_id: str
+    market_slug: str
+    token_id: str
+    token_side: str
+    direction: str
+    net_shares: float
+    pending_sell_shares: float
+    available_shares: float
+    avg_entry_price: float
+    last_trade_ts: float
 
 
 @dataclass
@@ -164,6 +185,10 @@ class TradePlan:
     spread_at_submit: float
     queue_ticks_at_submit: float
     tick_size_at_submit: float
+    order_side: str = "BUY"
+    order_type: str = "LIMIT"
+    quote_source: str = ""
+    exit_reason: str = ""
 
     @property
     def fill_prob(self) -> float:
@@ -197,11 +222,21 @@ class Executor:
         fill_prior_strength: float = 12.0,
         fill_confidence_scale: float = 8.0,
         fill_lower_bound_z: float = 1.0,
+        quote_max_spread_abs: float = 0.12,
+        quote_max_mid_deviation_abs: float = 0.10,
+        quote_extreme_edge_threshold: float = 0.02,
+        allow_quote_fallback: bool = True,
         max_live_orders_per_day: int = 0,
         max_live_notional_usd_per_day: float = 0.0,
         max_consecutive_expired: int = 0,
         circuit_breaker_cooldown_sec: float = 900.0,
         max_directional_exposure_usd: float = 0.0,
+        exit_enabled: bool = True,
+        exit_poll_interval_secs: float = 5.0,
+        exit_min_hold_secs: float = 15.0,
+        exit_resolution_buffer: float = 0.015,
+        exit_capital_lock_penalty: float = 0.01,
+        exit_min_improvement_abs: float = 0.005,
     ):
         self._bet_size = bet_size_usd
         self._dry_run = dry_run
@@ -220,11 +255,21 @@ class Executor:
         self._fill_prior_strength = fill_prior_strength
         self._fill_confidence_scale = fill_confidence_scale
         self._fill_lower_bound_z = fill_lower_bound_z
+        self._quote_max_spread_abs = quote_max_spread_abs
+        self._quote_max_mid_deviation_abs = quote_max_mid_deviation_abs
+        self._quote_extreme_edge_threshold = quote_extreme_edge_threshold
+        self._allow_quote_fallback = allow_quote_fallback
         self._max_live_orders_per_day = max_live_orders_per_day
         self._max_live_notional_usd_per_day = max_live_notional_usd_per_day
         self._max_consecutive_expired = max_consecutive_expired
         self._circuit_breaker_cooldown = circuit_breaker_cooldown_sec
         self._max_directional_exposure = max_directional_exposure_usd
+        self._exit_enabled = exit_enabled
+        self._exit_poll_interval = exit_poll_interval_secs
+        self._exit_min_hold_secs = exit_min_hold_secs
+        self._exit_resolution_buffer = exit_resolution_buffer
+        self._exit_capital_lock_penalty = exit_capital_lock_penalty
+        self._exit_min_improvement_abs = exit_min_improvement_abs
         self._clob = None
         self._db = None
         self._orders: list[TradeResult] = []
@@ -252,11 +297,15 @@ class Executor:
 
     @property
     def total_cost(self) -> float:
-        return sum(o.matched_cost_usd for o in self._orders)
+        return sum(o.matched_cost_usd for o in self._orders if o.order_side == "BUY")
 
     @property
     def total_committed(self) -> float:
-        return sum(max(0.0, o.cost_usd - o.matched_cost_usd) for o in self._orders if o.status == OrderStatus.PENDING)
+        return sum(
+            max(0.0, o.cost_usd - o.matched_cost_usd)
+            for o in self._orders
+            if o.status == OrderStatus.PENDING and o.order_side == "BUY"
+        )
 
     @property
     def skipped_low_liq(self) -> int:
@@ -314,6 +363,60 @@ class Executor:
     @staticmethod
     def _format_tick_size(tick_size: float) -> str:
         return f"{max(tick_size, 0.001):.3f}".rstrip("0").rstrip(".")
+
+    def _quote_is_sane(self, *, token_price: float, bid: float, ask: float, tick_size: float) -> bool:
+        tick = max(tick_size, 0.001)
+        if token_price <= tick or token_price >= 1.0 - tick:
+            return False
+        if bid <= 0 and ask <= 0:
+            return False
+        if bid > 0 and ask > 0:
+            if ask <= bid:
+                return False
+            spread = ask - bid
+            mid = 0.5 * (bid + ask)
+            if spread > max(self._quote_max_spread_abs, tick * 6):
+                return False
+            if abs(mid - token_price) > max(self._quote_max_mid_deviation_abs, tick * 4):
+                return False
+            if (
+                token_price > 0.10
+                and token_price < 0.90
+                and bid <= self._quote_extreme_edge_threshold
+                and ask >= 1.0 - self._quote_extreme_edge_threshold
+            ):
+                return False
+            return True
+        if bid > 0:
+            return abs(bid - token_price) <= max(self._quote_max_mid_deviation_abs, tick * 6)
+        return abs(ask - token_price) <= max(self._quote_max_mid_deviation_abs, tick * 6)
+
+    def _sanitize_quote(
+        self,
+        token_id: str,
+        token_price: float,
+        quote: TokenQuote,
+    ) -> TokenQuote | None:
+        tick = max(quote.tick_size, 0.001)
+        bid = max(0.0, quote.best_bid)
+        ask = max(0.0, quote.best_ask)
+        spread = quote.spread if quote.spread > 0 else max(0.0, ask - bid)
+        if self._quote_is_sane(token_price=token_price, bid=bid, ask=ask, tick_size=tick):
+            return TokenQuote(
+                token_id=token_id,
+                best_bid=bid,
+                best_ask=ask,
+                spread=max(0.0, spread),
+                tick_size=tick,
+                source=quote.source or "book",
+                executable_book=True,
+            )
+        if not self._allow_quote_fallback:
+            return None
+        fallback = self._fallback_token_quote(token_id, token_price, tick_size=tick)
+        fallback.source = "synthetic_fallback"
+        fallback.executable_book = False
+        return fallback
 
     @property
     def max_daily_orders(self) -> int:
@@ -654,14 +757,15 @@ class Executor:
             direction = trade.direction.upper()
             if direction not in exposure:
                 continue
+            sign = 1.0 if trade.order_side == "BUY" else -1.0
             if trade.status == OrderStatus.PENDING:
-                exposure[direction] += trade.cost_usd
+                exposure[direction] += sign * trade.cost_usd
             elif trade.status == OrderStatus.FILLED:
-                exposure[direction] += trade.matched_cost_usd
+                exposure[direction] += sign * trade.matched_cost_usd
         return exposure
 
-    def _fallback_token_quote(self, token_id: str, token_price: float) -> TokenQuote:
-        tick_size = 0.01
+    def _fallback_token_quote(self, token_id: str, token_price: float, *, tick_size: float = 0.01) -> TokenQuote:
+        tick_size = max(tick_size, 0.001)
         best_bid = self._round_price_to_tick(token_price - self._maker_offset_ticks * tick_size, tick_size)
         best_ask = self._round_price_to_tick(token_price + tick_size, tick_size)
         if best_ask <= best_bid:
@@ -672,6 +776,8 @@ class Executor:
             best_ask=max(best_bid, best_ask),
             spread=max(tick_size, best_ask - best_bid),
             tick_size=tick_size,
+            source="synthetic_fallback",
+            executable_book=False,
         )
 
     def _resolve_token_quote(
@@ -686,11 +792,13 @@ class Executor:
             if direction.upper() == "UP" and (market.up_best_bid > 0 or market.up_best_ask > 0):
                 tick_size = max(market.up_tick_size, 0.001)
                 spread = market.up_spread if market.up_spread > 0 else max(0.0, market.up_best_ask - market.up_best_bid)
-                return TokenQuote(token_id, market.up_best_bid, market.up_best_ask, spread, tick_size)
+                quote = TokenQuote(token_id, market.up_best_bid, market.up_best_ask, spread, tick_size, source="recorded_book")
+                return self._sanitize_quote(token_id, token_price, quote) or self._fallback_token_quote(token_id, token_price, tick_size=tick_size)
             if direction.upper() == "DOWN" and (market.down_best_bid > 0 or market.down_best_ask > 0):
                 tick_size = max(market.down_tick_size, 0.001)
                 spread = market.down_spread if market.down_spread > 0 else max(0.0, market.down_best_ask - market.down_best_bid)
-                return TokenQuote(token_id, market.down_best_bid, market.down_best_ask, spread, tick_size)
+                quote = TokenQuote(token_id, market.down_best_bid, market.down_best_ask, spread, tick_size, source="recorded_book")
+                return self._sanitize_quote(token_id, token_price, quote) or self._fallback_token_quote(token_id, token_price, tick_size=tick_size)
 
         if not self._dry_run:
             try:
@@ -701,13 +809,15 @@ class Executor:
                 best_ask = max(0.0, snapshot.best_ask)
                 if best_bid > 0 or best_ask > 0:
                     spread = snapshot.spread if snapshot.spread > 0 else max(tick_size, best_ask - best_bid)
-                    return TokenQuote(
+                    quote = TokenQuote(
                         token_id=token_id,
                         best_bid=best_bid,
                         best_ask=best_ask,
                         spread=max(0.0, spread),
                         tick_size=tick_size,
+                        source="clob_book",
                     )
+                    return self._sanitize_quote(token_id, token_price, quote) or self._fallback_token_quote(token_id, token_price, tick_size=tick_size)
             except Exception as exc:
                 logger.debug(f"CLOB book snapshot failed for {token_id}: {exc}")
         return self._fallback_token_quote(token_id, token_price)
@@ -731,6 +841,8 @@ class Executor:
         return True
 
     def _stale_order_reason(self, trade: TradeResult, signal: Signal | None) -> str:
+        if trade.order_side == "SELL":
+            return ""
         if signal is None:
             return "signal unavailable"
         if signal.direction.value != trade.direction:
@@ -811,6 +923,83 @@ class Executor:
             submitted_notional += trade.cost_usd
         return orders, submitted_notional
 
+    def open_positions(self) -> list[OpenPosition]:
+        rows: list[dict[str, Any]]
+        if self._db is not None:
+            rows = get_position_rows(self._db, is_paper=self._dry_run)
+        else:
+            buckets: dict[tuple[str, str, str, str, str, str, str], dict[str, Any]] = {}
+            for trade in self._orders:
+                key = (
+                    trade.asset,
+                    trade.market.market_id if trade.market else "",
+                    trade.market.condition_id if trade.market else "",
+                    trade.market.slug if trade.market else "",
+                    trade.token_id,
+                    trade.token_side,
+                    trade.direction,
+                )
+                row = buckets.setdefault(
+                    key,
+                    {
+                        "asset": trade.asset,
+                        "market_id": trade.market.market_id if trade.market else "",
+                        "condition_id": trade.market.condition_id if trade.market else "",
+                        "market_slug": trade.market.slug if trade.market else "",
+                        "token_id": trade.token_id,
+                        "token_side": trade.token_side,
+                        "direction": trade.direction,
+                        "net_shares": 0.0,
+                        "pending_sell_shares": 0.0,
+                        "gross_buy_cost_usd": 0.0,
+                        "gross_buy_shares": 0.0,
+                        "last_trade_ts": trade.timestamp,
+                    },
+                )
+                row["last_trade_ts"] = max(float(row["last_trade_ts"]), trade.timestamp)
+                if trade.order_side == "BUY":
+                    row["net_shares"] += trade.matched_shares
+                    row["gross_buy_cost_usd"] += trade.matched_cost_usd
+                    row["gross_buy_shares"] += trade.matched_shares
+                else:
+                    row["net_shares"] -= trade.matched_shares
+                    if trade.status == OrderStatus.PENDING and trade.shares > trade.matched_shares:
+                        row["pending_sell_shares"] += trade.shares - trade.matched_shares
+            rows = list(buckets.values())
+
+        positions: list[OpenPosition] = []
+        for row in rows:
+            asset = str(row.get("asset", "") or "")
+            token_id = str(row.get("token_id", "") or "")
+            if not asset or not token_id:
+                continue
+            net_shares = float(row.get("net_shares", 0) or 0)
+            pending_sell_shares = max(0.0, float(row.get("pending_sell_shares", 0) or 0))
+            available_shares = max(0.0, net_shares - pending_sell_shares)
+            if available_shares <= 1e-6:
+                continue
+            gross_buy_shares = float(row.get("gross_buy_shares", 0) or 0)
+            gross_buy_cost = float(row.get("gross_buy_cost_usd", 0) or 0)
+            avg_entry = gross_buy_cost / gross_buy_shares if gross_buy_shares > 1e-9 else 0.0
+            positions.append(
+                OpenPosition(
+                    asset=asset,
+                    binance_symbol=self._asset_to_binance_symbol(asset),
+                    market_id=str(row.get("market_id", "") or ""),
+                    condition_id=str(row.get("condition_id", "") or ""),
+                    market_slug=str(row.get("market_slug", "") or ""),
+                    token_id=token_id,
+                    token_side=str(row.get("token_side", "") or ""),
+                    direction=str(row.get("direction", "") or ""),
+                    net_shares=net_shares,
+                    pending_sell_shares=pending_sell_shares,
+                    available_shares=available_shares,
+                    avg_entry_price=avg_entry,
+                    last_trade_ts=float(row.get("last_trade_ts", 0) or 0),
+                )
+            )
+        return positions
+
     def _persist_trade(self, trade: TradeResult, raw_data: Any | None = None):
         if self._db is None:
             return
@@ -822,6 +1011,7 @@ class Executor:
                 event_title=trade.market.question if trade.market else trade.asset,
                 action=trade.direction,
                 side=trade.token_side,
+                order_side=trade.order_side,
                 asset=trade.asset,
                 market_id=trade.market.market_id if trade.market else "",
                 condition_id=trade.market.condition_id if trade.market else "",
@@ -849,6 +1039,7 @@ class Executor:
                 liquidity_at_submit=trade.liquidity_at_submit,
                 spread_at_submit=trade.spread_at_submit,
                 queue_ticks_at_submit=trade.queue_ticks_at_submit,
+                tick_size_at_submit=trade.tick_size_at_submit,
                 last_error=trade.last_error,
                 raw_data=raw_data,
             )
@@ -925,6 +1116,7 @@ class Executor:
                 binance_symbol=self._asset_to_binance_symbol(str(row.get("asset", "") or "")),
                 direction=str(row.get("action", "") or ""),
                 token_side=str(row.get("side", "") or ""),
+                order_side=str(row.get("order_side", "") or "BUY"),
                 token_id=str(row.get("token_id", "") or ""),
                 price=float(row.get("price", 0) or 0),
                 shares=float(row.get("size", 0) or 0),
@@ -949,7 +1141,7 @@ class Executor:
                 liquidity_at_submit=float(row.get("liquidity_at_submit", 0) or 0),
                 spread_at_submit=float(row.get("spread_at_submit", 0) or 0),
                 queue_ticks_at_submit=float(row.get("queue_ticks_at_submit", 0) or 0),
-                tick_size_at_submit=0.01,
+                tick_size_at_submit=float(row.get("tick_size_at_submit", 0.01) or 0.01),
                 db_id=int(row.get("id", 0) or 0),
                 last_error=str(row.get("last_error", "") or ""),
                 raw_status=status.value,
@@ -1231,6 +1423,9 @@ class Executor:
             spread_at_submit=spread,
             queue_ticks_at_submit=queue_ticks,
             tick_size_at_submit=tick_size,
+            order_side="BUY",
+            order_type="LIMIT",
+            quote_source=quote.source,
         )
 
     async def execute(self, signal: Signal) -> TradeResult | None:
@@ -1241,23 +1436,122 @@ class Executor:
         async with self._execute_lock:
             return await self._execute_plan(signal, plan)
 
+    async def execute_plan(self, plan: TradePlan) -> TradeResult | None:
+        async with self._execute_lock:
+            return await self._execute_plan(plan.signal, plan)
+
+    @property
+    def exit_enabled(self) -> bool:
+        return self._exit_enabled
+
+    @property
+    def exit_poll_interval(self) -> float:
+        return self._exit_poll_interval
+
+    def evaluate_exit_position(self, position: OpenPosition, estimate: MarketEstimate) -> TradePlan | None:
+        if not self._exit_enabled:
+            return None
+        if position.available_shares <= 0:
+            return None
+        if time.time() - position.last_trade_ts < self._exit_min_hold_secs:
+            return None
+
+        market = estimate.market
+        if market.secs_remaining <= 0:
+            return None
+        if position.token_id not in {market.up_token_id, market.down_token_id}:
+            return None
+
+        token_price = market.up_price if position.direction == "UP" else market.down_price
+        quote = self._resolve_token_quote(position.token_id, token_price, market, direction=position.direction)
+        if not quote.executable_book or quote.best_bid <= 0:
+            return None
+
+        shares = round(position.available_shares, 2)
+        if shares < market.order_min_size:
+            return None
+
+        hold_prob = estimate.up_win_prob if position.direction == "UP" else estimate.down_win_prob
+        exit_fee = market.taker_fee(shares, quote.best_bid) / max(shares, 1e-9)
+        net_exit_value = max(0.0, quote.best_bid - exit_fee)
+        hold_value = self._clamp(
+            hold_prob - self._exit_resolution_buffer - self._exit_capital_lock_penalty,
+            0.0,
+            1.0,
+        )
+        if net_exit_value + self._exit_min_improvement_abs < hold_value:
+            return None
+
+        synthetic_signal = Signal(
+            asset=estimate.asset,
+            binance_symbol=estimate.binance_symbol,
+            direction=Direction[position.direction],
+            current_price=estimate.current_price,
+            opening_price=estimate.opening_price,
+            deviation_pct=estimate.effective_deviation_pct,
+            win_prob=hold_prob,
+            market=market,
+            timestamp=estimate.timestamp,
+            price_source=estimate.price_source,
+            binance_deviation_pct=estimate.binance_deviation_pct,
+            official_deviation_pct=estimate.official_deviation_pct,
+            official_opening_price=estimate.official_opening_price,
+            official_current_price=estimate.official_current_price,
+            projected_official_price=estimate.projected_official_price,
+            source_gap_pct=estimate.source_gap_pct,
+        )
+
+        return TradePlan(
+            signal=synthetic_signal,
+            market=market,
+            binance_symbol=estimate.binance_symbol,
+            direction=position.direction,
+            token_side=position.token_side,
+            token_id=position.token_id,
+            price=quote.best_bid,
+            shares=shares,
+            cost_usd=shares * quote.best_bid,
+            win_prob=hold_prob,
+            expected_fill_ratio=1.0,
+            fill_ratio_lower_bound=1.0,
+            fill_confidence=1.0,
+            fill_effective_samples=1.0,
+            fill_source="exit_market",
+            filled_ev=max(0.0, (net_exit_value - hold_value) * shares),
+            submitted_ev=max(0.0, (net_exit_value - hold_value) * shares),
+            taker_fee_avoided=0.0,
+            expiration_ts=0,
+            secs_remaining_at_submit=market.secs_remaining,
+            liquidity_at_submit=market.liquidity,
+            spread_at_submit=quote.spread,
+            queue_ticks_at_submit=0.0,
+            tick_size_at_submit=quote.tick_size,
+            order_side="SELL",
+            order_type="MARKET",
+            quote_source=quote.source,
+            exit_reason=f"net bid {net_exit_value:.3f} >= hold {hold_value:.3f}",
+        )
+
     async def _execute_plan(self, signal: Signal, plan: TradePlan) -> TradeResult | None:
         market = plan.market
         raw_response: Any = {}
         last_error = ""
 
         if self._dry_run:
-            order_id = f"paper-{len(self._orders) + 1}"
-            alpha = max(0.3, plan.expected_fill_ratio * 2)
-            beta_param = max(0.3, (1 - plan.expected_fill_ratio) * 2)
-            sim_fill_ratio = random.betavariate(alpha, beta_param)
-            if sim_fill_ratio < 0.01:
-                sim_fill_ratio = 0.0
+            order_id = f"paper-{plan.order_side.lower()}-{len(self._orders) + 1}"
+            if plan.order_type == "MARKET":
+                sim_fill_ratio = 1.0
+            else:
+                alpha = max(0.3, plan.expected_fill_ratio * 2)
+                beta_param = max(0.3, (1 - plan.expected_fill_ratio) * 2)
+                sim_fill_ratio = random.betavariate(alpha, beta_param)
+                if sim_fill_ratio < 0.01:
+                    sim_fill_ratio = 0.0
             matched_shares = round(plan.shares * sim_fill_ratio, 6)
             matched_cost_usd = round(matched_shares * plan.price, 6)
             status = OrderStatus.FILLED if matched_shares > 0 else OrderStatus.EXPIRED
             logger.info(
-                f"[PAPER] {signal.asset} {signal.direction.value} -> buy {plan.token_side} "
+                f"[PAPER] {signal.asset} {signal.direction.value} -> {plan.order_side.lower()} {plan.token_side} "
                 f"@ ${plan.price:.2f} x {plan.shares:.1f} = ${plan.cost_usd:.2f} | "
                 f"p_adj={plan.win_prob:.1%} fill~{plan.expected_fill_ratio:.1%}/lb {plan.fill_ratio_lower_bound:.1%} "
                 f"fEV=${plan.filled_ev:.2f} sEV=${plan.submitted_ev:.2f} "
@@ -1266,15 +1560,24 @@ class Executor:
         else:
             try:
                 clob = self._ensure_clob()
-                raw_response = clob.place_limit_order(
-                    token_id=plan.token_id,
-                    side="BUY",
-                    price=plan.price,
-                    size=round(plan.shares, 2),
-                    tick_size=self._format_tick_size(plan.tick_size_at_submit),
-                    expiration=plan.expiration_ts,
-                    post_only=True,
-                )
+                if plan.order_type == "MARKET":
+                    raw_response = clob.place_market_order(
+                        token_id=plan.token_id,
+                        side=plan.order_side,
+                        amount=round(plan.shares, 2),
+                        worst_price=plan.price,
+                        tick_size=self._format_tick_size(plan.tick_size_at_submit),
+                    )
+                else:
+                    raw_response = clob.place_limit_order(
+                        token_id=plan.token_id,
+                        side=plan.order_side,
+                        price=plan.price,
+                        size=round(plan.shares, 2),
+                        tick_size=self._format_tick_size(plan.tick_size_at_submit),
+                        expiration=plan.expiration_ts,
+                        post_only=True,
+                    )
                 order_id = self._extract_order_id(raw_response)
                 last_error = self._extract_error(raw_response)
                 if not order_id:
@@ -1289,7 +1592,7 @@ class Executor:
                 )
                 status = status or OrderStatus.PENDING
                 logger.info(
-                    f"[LIVE] {signal.asset} {signal.direction.value} -> buy {plan.token_side} "
+                    f"[LIVE] {signal.asset} {signal.direction.value} -> {plan.order_side.lower()} {plan.token_side} "
                     f"@ ${plan.price:.2f} x {plan.shares:.1f} | "
                     f"p={plan.win_prob:.1%} fill~{plan.expected_fill_ratio:.1%}/lb {plan.fill_ratio_lower_bound:.1%} "
                     f"fEV=${plan.filled_ev:.2f} sEV=${plan.submitted_ev:.2f} "
@@ -1313,6 +1616,7 @@ class Executor:
             cost_usd=plan.cost_usd,
             matched_cost_usd=matched_cost_usd,
             order_id=order_id,
+            order_side=plan.order_side,
             is_paper=self._dry_run,
             timestamp=time.time(),
             status=status,

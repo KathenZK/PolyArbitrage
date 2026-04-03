@@ -39,6 +39,7 @@ class RedeemerTests(unittest.IsolatedAsyncioTestCase):
             event_title="test",
             action="UP",
             side="Up",
+            order_side="BUY",
             asset="BTC",
             market_id="market-1",
             condition_id=tracked_condition,

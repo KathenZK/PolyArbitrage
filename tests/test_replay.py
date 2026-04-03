@@ -91,6 +91,7 @@ class ReplayTests(unittest.TestCase):
                 "secs_elapsed": 300,
                 "resolved_official_opening_price": 100000,
                 "resolved_official_final_price": 102000,
+                "actual_fill_ratio": 0.5,
             },
             {
                 "timestamp": 1_700_000_030,
@@ -107,6 +108,7 @@ class ReplayTests(unittest.TestCase):
                 "secs_elapsed": 330,
                 "resolved_official_opening_price": 100000,
                 "resolved_official_final_price": 102000,
+                "actual_fill_ratio": 0.5,
             },
         ]
 

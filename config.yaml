@@ -39,6 +39,23 @@ strategy:
   fill_prior_strength: 12          # pseudo-sample count for the heuristic prior
   fill_confidence_scale: 8         # higher = slower confidence growth
   fill_lower_bound_z: 1.0          # use mean - z * stderr as conservative fill ratio
+  quote_max_spread_abs: 0.12       # reject token books wider than this; likely dust/stale
+  quote_max_mid_deviation_abs: 0.10
+  quote_extreme_edge_threshold: 0.02
+  allow_quote_fallback: true       # if token top-of-book is obviously bad, fall back to synthetic quote around token_price
+
+  # Exit: sell-first, redeem-fallback
+  exit_enabled: true
+  exit_poll_interval_sec: 5
+  exit_min_hold_secs: 15
+  exit_resolution_buffer: 0.015
+  exit_capital_lock_penalty: 0.01
+  exit_min_improvement_abs: 0.005
+
+  # Probability calibration (optional; generated from annotated resolved-truth recordings)
+  prob_calibration_path: "data/calibration/prob_calibration.json"
+  prob_calibration_min_samples: 50
+  prob_calibration_prior_strength: 20.0
 
   # Market registry
   registry_refresh_sec: 15

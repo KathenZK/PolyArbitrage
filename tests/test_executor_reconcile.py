@@ -8,8 +8,8 @@ from pathlib import Path
 
 from src.data.market_registry import CryptoMarket
 from src.output.db import get_connection, init_db, insert_trade
-from src.strategies.executor import Executor, OrderStatus, TokenQuote
-from src.strategies.momentum import Direction, Signal
+from src.strategies.executor import Executor, OpenPosition, OrderStatus, TokenQuote
+from src.strategies.momentum import Direction, MarketEstimate, Signal
 
 
 class FakeCLOB:
@@ -149,6 +149,7 @@ class ExecutorReconcileTests(unittest.TestCase):
             event_title="seed",
             action="UP",
             side="Up",
+            order_side="BUY",
             asset="BTC",
             market_id="seed-market",
             condition_id="0xseedcond",
@@ -210,6 +211,72 @@ class ExecutorReconcileTests(unittest.TestCase):
 
         self.assertTrue(sent)
         self.assertEqual(fake_clob.heartbeats, [None])
+
+    def test_dust_token_book_falls_back_to_synthetic_quote(self):
+        class DustCLOB(FakeCLOB):
+            def get_book_snapshot(self, token_id: str) -> TokenQuote:
+                return TokenQuote(
+                    token_id=token_id,
+                    best_bid=0.01,
+                    best_ask=0.99,
+                    spread=0.98,
+                    tick_size=0.01,
+                )
+
+        executor = Executor(dry_run=False)
+        executor.attach_db(self.conn)
+        executor._clob = DustCLOB(final_status="live")
+
+        plan = executor.evaluate_signal(build_signal())
+        self.assertIsNotNone(plan)
+        self.assertGreater(plan.price, 0.50)
+        self.assertEqual(plan.quote_source, "synthetic_fallback")
+
+    def test_exit_plan_uses_sell_market_order_when_bid_beats_hold_value(self):
+        executor = Executor(dry_run=False)
+        executor.attach_db(self.conn)
+        executor._clob = FakeCLOB(final_status="matched")
+
+        signal = build_signal()
+        estimate = MarketEstimate(
+            asset="BTC",
+            binance_symbol="btcusdt",
+            market=signal.market,
+            timestamp=time.time(),
+            current_price=signal.current_price,
+            opening_price=signal.opening_price,
+            effective_deviation_pct=signal.deviation_pct,
+            price_source=signal.price_source,
+            binance_deviation_pct=signal.binance_deviation_pct,
+            official_deviation_pct=signal.official_deviation_pct,
+            official_opening_price=signal.official_opening_price,
+            official_current_price=signal.official_current_price,
+            projected_official_price=signal.projected_official_price,
+            source_gap_pct=signal.source_gap_pct,
+            up_win_prob=0.55,
+            down_win_prob=0.45,
+        )
+        position = OpenPosition(
+            asset="BTC",
+            binance_symbol="btcusdt",
+            market_id=signal.market.market_id,
+            condition_id=signal.market.condition_id,
+            market_slug=signal.market.slug,
+            token_id=signal.market.up_token_id,
+            token_side="Up",
+            direction="UP",
+            net_shares=10.0,
+            pending_sell_shares=0.0,
+            available_shares=10.0,
+            avg_entry_price=0.60,
+            last_trade_ts=time.time() - 60,
+        )
+
+        plan = executor.evaluate_exit_position(position, estimate)
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.order_side, "SELL")
+        self.assertEqual(plan.order_type, "MARKET")
+        self.assertEqual(plan.price, 0.61)
 
 
 if __name__ == "__main__":

@@ -36,6 +36,30 @@ class PolymarketClientTests(unittest.TestCase):
         self.assertAlmostEqual(metadata["official_opening_price"], 66569.02175162079, places=6)
         self.assertGreater(metadata["fetched_at"], 0)
 
+    def test_event_page_metadata_parser_supports_dehydrated_state_event_query(self):
+        html = """
+        <html><body>
+        <script id="__NEXT_DATA__" type="application/json" crossorigin="anonymous">
+        {"props":{"pageProps":{
+            "key":"[\\"btc-updown-15m-123\\"]",
+            "dehydratedState":{"mutations":[],"queries":[
+                {
+                    "queryKey":["/api/event/slug","btc-updown-15m-123"],
+                    "state":{"data":{
+                        "slug":"btc-updown-15m-123",
+                        "eventMetadata":{"finalPrice":66499.978,"priceToBeat":66620.11899999999}
+                    }}
+                }
+            ]}
+        }}}
+        </script>
+        </body></html>
+        """
+        metadata = PolymarketGammaClient._parse_event_page_metadata("btc-updown-15m-123", html)
+        self.assertAlmostEqual(metadata["official_current_price"], 66499.978, places=6)
+        self.assertAlmostEqual(metadata["official_opening_price"], 66620.11899999999, places=6)
+        self.assertGreater(metadata["fetched_at"], 0)
+
     def test_orderbook_helpers_support_sdk_objects(self):
         client = PolymarketCLOBClient("test-key")
         client.get_orderbook = lambda token_id: BookObj(

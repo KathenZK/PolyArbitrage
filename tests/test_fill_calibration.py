@@ -52,6 +52,7 @@ def seed_trade(conn, *, matched_ratio: float, hours_ago: float):
         event_title="test",
         action="UP",
         side="Up",
+        order_side="BUY",
         asset="BTC",
         market_id="m1",
         condition_id="0xcond1",

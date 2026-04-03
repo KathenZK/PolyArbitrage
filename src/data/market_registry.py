@@ -31,6 +31,8 @@ logger = logging.getLogger(__name__)
 WINDOW_SECS = 900
 MAX_OPENING_PRICE_DELAY = 15
 TICK_BUFFER_SECS = 30
+OPENING_REST_LOOKBACK_SECS = 120
+OPENING_REST_MAX_DELAY_SECS = 60
 _SECS_PER_YEAR = 365.25 * 24 * 3600
 
 
@@ -87,6 +89,7 @@ class CryptoMarket:
     official_binance_ref_price: float = 0.0
     official_price_updated_at: float = 0.0
     official_binance_ref_ts: float = 0.0
+    opening_backfill_checked_at: float = 0.0
 
     @property
     def secs_remaining(self) -> float:
@@ -204,6 +207,19 @@ class MarketRegistry:
         while vol_buf and vol_buf[0][0] < vol_cutoff:
             vol_buf.popleft()
 
+        market = self._markets.get(binance_symbol)
+        if (
+            market
+            and market.has_official_opening_price
+            and market.has_official_current_price
+            and (
+                market.official_binance_ref_price <= 0
+                or market.official_binance_ref_ts < market.official_price_updated_at
+            )
+        ):
+            market.official_binance_ref_price = price
+            market.official_binance_ref_ts = tick_ts
+
     def realized_vol(self, binance_symbol: str) -> float:
         """Annualized realized volatility from recent tick stream (sum-of-squared-log-returns)."""
         buf = self._vol_buffer.get(binance_symbol)
@@ -236,6 +252,8 @@ class MarketRegistry:
             return
 
         age = tick_ts - market.event_start if tick_ts > 0 else market.secs_elapsed
+        if age < -1.0:
+            return
         if age > MAX_OPENING_PRICE_DELAY:
             return
 
@@ -247,7 +265,7 @@ class MarketRegistry:
             logger.info(f"Opening price: {sym} = ${best_price:,.2f} (tick {delta:+.1f}s from window start)")
             return
 
-        if age <= 5:
+        if 0.0 <= age <= MAX_OPENING_PRICE_DELAY:
             market.opening_price = price
             sym = market.asset.upper()
             logger.info(f"Opening price: {sym} = ${price:,.2f} (live tick {age:.1f}s into window)")
@@ -297,9 +315,80 @@ class MarketRegistry:
             market.official_price_updated_at = float(metadata.get("fetched_at", time.time()) or time.time())
 
         latest_binance = self._latest_buffered_price(market.binance_symbol)
-        if latest_binance > 0:
+        if (opening > 0 or current > 0) and latest_binance > 0:
             market.official_binance_ref_price = latest_binance
             market.official_binance_ref_ts = time.time()
+
+    async def _backfill_opening_price(self, market: CryptoMarket):
+        if market.has_opening_price:
+            return
+
+        now = time.time()
+        age = now - market.event_start
+        if age < 0 or age > OPENING_REST_LOOKBACK_SECS:
+            return
+        if now - market.opening_backfill_checked_at < 10:
+            return
+        market.opening_backfill_checked_at = now
+
+        session = await self._gamma._ensure_session()
+        start_ms = int((market.event_start - 1) * 1000)
+        end_ms = int((market.event_start + OPENING_REST_MAX_DELAY_SECS) * 1000)
+        params = {
+            "symbol": market.binance_symbol.upper(),
+            "startTime": start_ms,
+            "endTime": end_ms,
+            "limit": 1000,
+        }
+        try:
+            async with session.get(
+                "https://api.binance.com/api/v3/aggTrades",
+                params=params,
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as r:
+                r.raise_for_status()
+                trades = await r.json()
+        except Exception as exc:
+            logger.debug(f"Opening backfill failed for {market.binance_symbol}: {exc}")
+            return
+
+        best_price = 0.0
+        best_ts = 0.0
+        best_abs_delta = float("inf")
+        fallback_price = 0.0
+        fallback_ts = 0.0
+        fallback_delta = float("inf")
+
+        for trade in trades if isinstance(trades, list) else []:
+            try:
+                ts = float(trade["T"]) / 1000.0
+                price = float(trade["p"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            delta = ts - market.event_start
+            if -1.0 <= delta <= 5.0 and abs(delta) < best_abs_delta:
+                best_abs_delta = abs(delta)
+                best_price = price
+                best_ts = ts
+            if 0.0 <= delta <= OPENING_REST_MAX_DELAY_SECS and delta < fallback_delta:
+                fallback_delta = delta
+                fallback_price = price
+                fallback_ts = ts
+
+        if best_price > 0:
+            market.opening_price = best_price
+            logger.info(
+                f"Opening price (REST backfill): {market.asset.upper()} = "
+                f"${best_price:,.2f} ({best_ts - market.event_start:+.1f}s from window start)"
+            )
+            return
+
+        if fallback_price > 0:
+            market.opening_price = fallback_price
+            logger.warning(
+                f"Opening price (late REST fallback): {market.asset.upper()} = "
+                f"${fallback_price:,.2f} ({fallback_ts - market.event_start:+.1f}s from window start)"
+            )
 
     async def refresh(self):
         ws = current_window_start()
@@ -372,6 +461,16 @@ class MarketRegistry:
         if stale:
             await asyncio.gather(
                 *(self._refresh_official_metadata(m) for m in stale),
+                return_exceptions=True,
+            )
+
+        missing_open = [
+            m for m in self._markets.values()
+            if not m.has_opening_price and 0 <= time.time() - m.event_start <= OPENING_REST_LOOKBACK_SECS
+        ]
+        if missing_open:
+            await asyncio.gather(
+                *(self._backfill_opening_price(m) for m in missing_open),
                 return_exceptions=True,
             )
 

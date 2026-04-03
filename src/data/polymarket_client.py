@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -136,47 +137,88 @@ class PolymarketGammaClient:
             return await r.json()
 
     @staticmethod
-    def _parse_event_page_metadata(slug: str, html: str) -> dict[str, float]:
-        start_tag = '<script id="__NEXT_DATA__" type="application/json">'
-        start_idx = html.find(start_tag)
-        if start_idx < 0:
+    def _extract_prices_from_event_entry(entry: Any) -> dict[str, float]:
+        if not isinstance(entry, dict):
             return {}
-        json_start = start_idx + len(start_tag)
+        meta = entry.get("eventMetadata")
+        if not isinstance(meta, dict):
+            return {}
+        try:
+            final_price = float(meta["finalPrice"])
+            price_to_beat = float(meta["priceToBeat"])
+        except (KeyError, TypeError, ValueError):
+            return {}
+        return {
+            "official_current_price": final_price,
+            "official_opening_price": price_to_beat,
+            "fetched_at": time.time(),
+        }
+
+    @classmethod
+    def _parse_event_page_metadata(cls, slug: str, html: str) -> dict[str, float]:
+        script_marker = '<script id="__NEXT_DATA__"'
+        start_idx = html.find(script_marker)
+        if start_idx < 0:
+            return cls._parse_event_page_metadata_fallback(html)
+        json_start = html.find(">", start_idx)
+        if json_start < 0:
+            return cls._parse_event_page_metadata_fallback(html)
+        json_start += 1
         end_idx = html.find("</script>", json_start)
         if end_idx < 0:
-            return {}
+            return cls._parse_event_page_metadata_fallback(html)
 
         try:
             payload = json.loads(html[json_start:end_idx])
         except (json.JSONDecodeError, ValueError):
-            return {}
+            return cls._parse_event_page_metadata_fallback(html)
 
-        data_list = (
-            payload
-            .get("props", {})
-            .get("pageProps", {})
-            .get("data", [])
+        page_props = payload.get("props", {}).get("pageProps", {})
+        data_list = page_props.get("data", [])
+        if isinstance(data_list, list):
+            for entry in data_list:
+                if not isinstance(entry, dict) or entry.get("slug") != slug:
+                    continue
+                prices = cls._extract_prices_from_event_entry(entry)
+                if prices:
+                    return prices
+
+        dehydrated = page_props.get("dehydratedState", {})
+        queries = dehydrated.get("queries", [])
+        if isinstance(queries, list):
+            for query in queries:
+                if not isinstance(query, dict):
+                    continue
+                state = query.get("state", {})
+                data = state.get("data")
+                candidates = data if isinstance(data, list) else [data]
+                for entry in candidates:
+                    if not isinstance(entry, dict) or entry.get("slug") != slug:
+                        continue
+                    prices = cls._extract_prices_from_event_entry(entry)
+                    if prices:
+                        return prices
+
+        return cls._parse_event_page_metadata_fallback(html)
+
+    @staticmethod
+    def _parse_event_page_metadata_fallback(html: str) -> dict[str, float]:
+        match = re.search(
+            r'"eventMetadata"\s*:\s*\{[^{}]*"finalPrice"\s*:\s*([0-9.]+)[^{}]*"priceToBeat"\s*:\s*([0-9.]+)',
+            html,
         )
-        if not isinstance(data_list, list):
+        if not match:
             return {}
-
-        for entry in data_list:
-            if not isinstance(entry, dict) or entry.get("slug") != slug:
-                continue
-            meta = entry.get("eventMetadata")
-            if not isinstance(meta, dict):
-                continue
-            try:
-                final_price = float(meta["finalPrice"])
-                price_to_beat = float(meta["priceToBeat"])
-            except (KeyError, TypeError, ValueError):
-                continue
-            return {
-                "official_current_price": final_price,
-                "official_opening_price": price_to_beat,
-                "fetched_at": time.time(),
-            }
-        return {}
+        try:
+            final_price = float(match.group(1))
+            price_to_beat = float(match.group(2))
+        except (TypeError, ValueError):
+            return {}
+        return {
+            "official_current_price": final_price,
+            "official_opening_price": price_to_beat,
+            "fetched_at": time.time(),
+        }
 
     @staticmethod
     def _parse_list_field(raw: Any) -> list[Any]:

@@ -16,6 +16,7 @@ TRADE_COLUMNS: dict[str, str] = {
     "asset": "TEXT NOT NULL DEFAULT ''",
     "condition_id": "TEXT DEFAULT ''",
     "market_slug": "TEXT DEFAULT ''",
+    "order_side": "TEXT NOT NULL DEFAULT 'BUY'",
     "order_id": "TEXT DEFAULT ''",
     "matched_size": "REAL NOT NULL DEFAULT 0",
     "matched_cost_usd": "REAL NOT NULL DEFAULT 0",
@@ -33,6 +34,7 @@ TRADE_COLUMNS: dict[str, str] = {
     "liquidity_at_submit": "REAL NOT NULL DEFAULT 0",
     "spread_at_submit": "REAL NOT NULL DEFAULT 0",
     "queue_ticks_at_submit": "REAL NOT NULL DEFAULT 0",
+    "tick_size_at_submit": "REAL NOT NULL DEFAULT 0.01",
     "last_error": "TEXT DEFAULT ''",
     "raw_json": "TEXT DEFAULT '{}'",
 }
@@ -137,6 +139,7 @@ def insert_trade(
     event_title: str,
     action: str,
     side: str,
+    order_side: str,
     asset: str,
     market_id: str,
     market_slug: str,
@@ -164,6 +167,7 @@ def insert_trade(
     liquidity_at_submit: float = 0.0,
     spread_at_submit: float = 0.0,
     queue_ticks_at_submit: float = 0.0,
+    tick_size_at_submit: float = 0.01,
     last_error: str = "",
     raw_data: Any | None = None,
 ) -> int:
@@ -172,14 +176,15 @@ def insert_trade(
         """
         INSERT INTO trades (
             timestamp, updated_at, strategy, event_title, action, side, asset,
-            market_id, condition_id, market_slug, token_id, order_id, price, size,
+            market_id, condition_id, market_slug, token_id, order_side, order_id, price, size,
             matched_size, cost_usd, matched_cost_usd, is_paper, status,
             win_prob, fill_prob, fill_lower_bound, fill_confidence,
             fill_effective_samples, fill_source, filled_ev_usd, expected_value_usd,
             taker_fee_avoided, expiration_ts, secs_remaining_at_submit,
             liquidity_at_submit, spread_at_submit, queue_ticks_at_submit,
+            tick_size_at_submit,
             last_error, raw_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             now,
@@ -193,6 +198,7 @@ def insert_trade(
             condition_id,
             market_slug,
             token_id,
+            order_side,
             order_id,
             price,
             size,
@@ -215,6 +221,7 @@ def insert_trade(
             liquidity_at_submit,
             spread_at_submit,
             queue_ticks_at_submit,
+            tick_size_at_submit,
             last_error,
             json.dumps(raw_data or {}),
         ),
@@ -286,6 +293,55 @@ def get_tracked_live_condition_ids(conn: sqlite3.Connection) -> set[str]:
         """
     ).fetchall()
     return {str(row["condition_id"]) for row in rows if row["condition_id"]}
+
+
+def get_position_rows(conn: sqlite3.Connection, *, is_paper: bool) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT
+            asset,
+            market_id,
+            condition_id,
+            market_slug,
+            token_id,
+            side AS token_side,
+            action AS direction,
+            SUM(
+                CASE
+                    WHEN COALESCE(order_side, 'BUY')='BUY' THEN matched_size
+                    ELSE -matched_size
+                END
+            ) AS net_shares,
+            SUM(
+                CASE
+                    WHEN COALESCE(order_side, 'BUY')='SELL' AND status='pending' AND size > matched_size
+                    THEN size - matched_size
+                    ELSE 0
+                END
+            ) AS pending_sell_shares,
+            SUM(
+                CASE
+                    WHEN COALESCE(order_side, 'BUY')='BUY' THEN matched_cost_usd
+                    ELSE 0
+                END
+            ) AS gross_buy_cost_usd,
+            SUM(
+                CASE
+                    WHEN COALESCE(order_side, 'BUY')='BUY' THEN matched_size
+                    ELSE 0
+                END
+            ) AS gross_buy_shares,
+            MAX(timestamp) AS last_trade_ts
+        FROM trades
+        WHERE is_paper=?
+          AND token_id <> ''
+        GROUP BY asset, market_id, condition_id, market_slug, token_id, side, action
+        HAVING ABS(net_shares) > 1e-9
+        ORDER BY last_trade_ts ASC
+        """,
+        (1 if is_paper else 0,),
+    ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def upsert_redeem_candidate(

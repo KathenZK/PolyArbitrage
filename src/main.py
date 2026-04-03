@@ -86,6 +86,9 @@ class Pipeline:
             max_source_divergence_pct=strat.get("max_source_divergence_pct", 0.0025),
             source_gap_penalty_mult=strat.get("source_gap_penalty_mult", 8.0),
             use_realized_vol=strat.get("use_realized_vol", False),
+            prob_calibration_path=strat.get("prob_calibration_path"),
+            prob_calibration_min_samples=strat.get("prob_calibration_min_samples", 50),
+            prob_calibration_prior_strength=strat.get("prob_calibration_prior_strength", 20.0),
         )
         self.guard = SignalGuard(
             cooldown_secs=strat.get("signal_cooldown_sec", 120),
@@ -108,11 +111,21 @@ class Pipeline:
             fill_prior_strength=strat.get("fill_prior_strength", 12),
             fill_confidence_scale=strat.get("fill_confidence_scale", 8),
             fill_lower_bound_z=strat.get("fill_lower_bound_z", 1.0),
+            quote_max_spread_abs=strat.get("quote_max_spread_abs", 0.12),
+            quote_max_mid_deviation_abs=strat.get("quote_max_mid_deviation_abs", 0.10),
+            quote_extreme_edge_threshold=strat.get("quote_extreme_edge_threshold", 0.02),
+            allow_quote_fallback=strat.get("allow_quote_fallback", True),
             max_live_orders_per_day=risk.get("max_live_orders_per_day", 0),
             max_live_notional_usd_per_day=risk.get("max_live_notional_usd_per_day", 0.0),
             max_consecutive_expired=risk.get("max_consecutive_expired", 0),
             circuit_breaker_cooldown_sec=risk.get("circuit_breaker_cooldown_sec", 900),
             max_directional_exposure_usd=risk.get("max_directional_exposure_usd", 0.0),
+            exit_enabled=strat.get("exit_enabled", True),
+            exit_poll_interval_secs=strat.get("exit_poll_interval_sec", 5.0),
+            exit_min_hold_secs=strat.get("exit_min_hold_secs", 15.0),
+            exit_resolution_buffer=strat.get("exit_resolution_buffer", 0.015),
+            exit_capital_lock_penalty=strat.get("exit_capital_lock_penalty", 0.01),
+            exit_min_improvement_abs=strat.get("exit_min_improvement_abs", 0.005),
         )
         redeem_cfg = config.get("redeem", {})
         self.redeemer = ProxyRedeemer(
@@ -174,11 +187,12 @@ class Pipeline:
             if result:
                 logger.info(
                     f"Trade #{result.order_id}: {result.direction} {signal.asset} "
-                    f"buy {result.token_side} ${result.cost_usd:.2f}"
+                    f"{result.order_side.lower()} {result.token_side} ${result.cost_usd:.2f}"
                 )
                 await self.alerts.send_trade(
                     symbol=signal.asset,
                     direction=result.direction,
+                    order_side=result.order_side,
                     price=result.price,
                     shares=result.shares,
                     cost=result.cost_usd,
@@ -189,6 +203,53 @@ class Pipeline:
                 )
         except Exception as e:
             logger.error(f"Execution error: {e}")
+
+    def _market_for_position(self, position):
+        for market in self.registry.all_markets:
+            if position.condition_id and market.condition_id == position.condition_id:
+                return market
+            if position.token_id in {market.up_token_id, market.down_token_id}:
+                return market
+        return None
+
+    async def _exit_loop(self):
+        while True:
+            try:
+                if self.executor.exit_enabled:
+                    for position in self.executor.open_positions():
+                        market = self._market_for_position(position)
+                        if market is None:
+                            continue
+                        price = self.last_prices.get(market.binance_symbol)
+                        if price is None or price <= 0:
+                            continue
+                        estimate = self.comparator.estimate(market.binance_symbol, price, time.time())
+                        if estimate is None:
+                            continue
+                        plan = self.executor.evaluate_exit_position(position, estimate)
+                        if plan is None:
+                            continue
+                        result = await self.executor.execute_plan(plan)
+                        if result:
+                            logger.info(
+                                f"Exit #{result.order_id}: {result.direction} {result.asset} "
+                                f"{result.order_side.lower()} {result.token_side} ${result.cost_usd:.2f}"
+                            )
+                            await self.alerts.send_trade(
+                                symbol=result.asset,
+                                direction=result.direction,
+                                order_side=result.order_side,
+                                price=result.price,
+                                shares=result.shares,
+                                cost=result.cost_usd,
+                                momentum=estimate.effective_deviation_pct,
+                                market_question=result.market.question if result.market else "",
+                                is_paper=result.is_paper,
+                                order_id=result.order_id,
+                            )
+            except Exception as e:
+                logger.error(f"Exit loop error: {e}")
+            await asyncio.sleep(max(1.0, self.executor.exit_poll_interval))
 
     async def _reconcile_loop(self):
         while True:
@@ -352,6 +413,7 @@ class Pipeline:
 
         stream_task = asyncio.create_task(self.stream.run())
         reconcile_task = asyncio.create_task(self._reconcile_loop())
+        exit_task = asyncio.create_task(self._exit_loop())
         redeem_task = asyncio.create_task(self._redeem_loop()) if not dry_run else None
         clob_heartbeat_task = asyncio.create_task(self._clob_heartbeat_loop()) if not dry_run else None
         heartbeat_task = asyncio.create_task(self._heartbeat_loop())
@@ -372,6 +434,7 @@ class Pipeline:
             registry_task.cancel()
             stream_task.cancel()
             reconcile_task.cancel()
+            exit_task.cancel()
             if redeem_task is not None:
                 redeem_task.cancel()
             if clob_heartbeat_task is not None:
@@ -403,6 +466,7 @@ class Pipeline:
             await self.executor.send_heartbeat(force=True)
         self.redeemer.attach_clob(self.executor._clob)
         reconcile_task = asyncio.create_task(self._reconcile_loop())
+        exit_task = asyncio.create_task(self._exit_loop())
         redeem_task = asyncio.create_task(self._redeem_loop()) if not dry_run else None
         clob_heartbeat_task = asyncio.create_task(self._clob_heartbeat_loop()) if not dry_run else None
         heartbeat_task = asyncio.create_task(self._heartbeat_loop())
@@ -417,6 +481,7 @@ class Pipeline:
         finally:
             registry_task.cancel()
             reconcile_task.cancel()
+            exit_task.cancel()
             if redeem_task is not None:
                 redeem_task.cancel()
             if clob_heartbeat_task is not None:

@@ -43,7 +43,10 @@ class SnapshotRecorder:
             self.gamma,
             assets=assets,
             refresh_interval=strat.get("registry_refresh_sec", 15),
+            official_refresh_interval=strat.get("official_refresh_sec", 60),
             min_liquidity=strat.get("min_liquidity", 1000),
+            vol_lookback_sec=strat.get("realized_vol_lookback_sec", 300),
+            vol_min_ticks=strat.get("realized_vol_min_ticks", 20),
         )
         self.stream = BinanceStream(
             symbols=strat.get("symbols", ["btcusdt", "ethusdt", "solusdt"]),

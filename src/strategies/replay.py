@@ -21,7 +21,13 @@ from typing import Any
 
 from src.data.market_registry import CryptoMarket, WINDOW_SECS
 from src.strategies.executor import Executor, TradePlan
-from src.strategies.momentum import DEFAULT_ANNUAL_VOL, Direction, Signal, estimate_win_prob
+from src.strategies.momentum import (
+    DEFAULT_ANNUAL_VOL,
+    Direction,
+    ProbabilityCalibrator,
+    Signal,
+    calibrated_same_side_prob,
+)
 from src.strategies.signal_guard import SignalGuard
 
 
@@ -55,6 +61,7 @@ class ReplayTrade:
     quote_price: float
     win_prob: float
     fill_prob: float
+    actual_fill_ratio: float | None
     filled_ev: float
     submitted_ev: float
     realized_filled_pnl: float | None
@@ -159,6 +166,7 @@ def signal_from_row(
     official_max_age_secs: float = 90.0,
     max_source_divergence_pct: float = 0.0025,
     source_gap_penalty_mult: float = 8.0,
+    calibrator: ProbabilityCalibrator | None = None,
 ) -> Signal | None:
     market = _build_market(row)
     binance_opening = _parse_float(row, "opening_price", market.opening_price)
@@ -214,10 +222,17 @@ def signal_from_row(
     direction = Direction.UP if deviation > 0 else Direction.DOWN
     symbol = _symbol(row)
     annual_vol = (annual_vols or DEFAULT_ANNUAL_VOL).get(symbol, 0.70)
-    win_prob = estimate_win_prob(abs(deviation), secs_remaining, annual_vol)
     source_gap = abs(binance_deviation - official_deviation) if using_official and binance_opening > 0 else 0.0
-    if using_official and source_gap > 0:
-        win_prob = max(0.50, win_prob - min(0.20, source_gap * source_gap_penalty_mult))
+    same_side_prob, _, _ = calibrated_same_side_prob(
+        asset=market.asset,
+        deviation_abs=abs(deviation),
+        secs_remaining=secs_remaining,
+        annual_vol=annual_vol,
+        source_gap=source_gap if using_official else 0.0,
+        source_gap_penalty_mult=source_gap_penalty_mult,
+        calibrator=calibrator,
+    )
+    win_prob = same_side_prob
     timestamp = _parse_float(row, "timestamp", time.time())
 
     market.opening_price = binance_opening
@@ -301,8 +316,17 @@ def run_replay(rows: list[dict[str, Any]], config: dict[str, Any]) -> ReplaySumm
         fill_rate_prior=strat.get("fill_rate_prior", 0.35),
         fill_min_samples=strat.get("fill_min_samples", 20),
         fill_lookback_hours=strat.get("fill_lookback_hours", 168),
+        quote_max_spread_abs=strat.get("quote_max_spread_abs", 0.12),
+        quote_max_mid_deviation_abs=strat.get("quote_max_mid_deviation_abs", 0.10),
+        quote_extreme_edge_threshold=strat.get("quote_extreme_edge_threshold", 0.02),
+        allow_quote_fallback=strat.get("allow_quote_fallback", True),
     )
     guard = SignalGuard(cooldown_secs=strat.get("signal_cooldown_sec", 120))
+    calibrator = ProbabilityCalibrator(
+        strat.get("prob_calibration_path"),
+        min_samples=strat.get("prob_calibration_min_samples", 50),
+        prior_strength=strat.get("prob_calibration_prior_strength", 20.0),
+    )
 
     signals = 0
     trades: list[ReplayTrade] = []
@@ -319,6 +343,7 @@ def run_replay(rows: list[dict[str, Any]], config: dict[str, Any]) -> ReplaySumm
             official_max_age_secs=strat.get("official_max_age_sec", 90),
             max_source_divergence_pct=strat.get("max_source_divergence_pct", 0.0025),
             source_gap_penalty_mult=strat.get("source_gap_penalty_mult", 8.0),
+            calibrator=calibrator,
         )
         if signal is None:
             continue
@@ -335,11 +360,11 @@ def run_replay(rows: list[dict[str, Any]], config: dict[str, Any]) -> ReplaySumm
         realized_filled_pnl = _filled_pnl(plan, settle_side)
         actual_fill_ratio = row.get("actual_fill_ratio", row.get("fill_ratio", ""))
         if actual_fill_ratio in ("", None):
-            fill_ratio = plan.fill_prob
+            fill_ratio = None
         else:
             fill_ratio = float(actual_fill_ratio)
         realized_submitted_pnl = None
-        if realized_filled_pnl is not None:
+        if realized_filled_pnl is not None and fill_ratio is not None:
             realized_submitted_pnl = realized_filled_pnl * fill_ratio
 
         trade = ReplayTrade(
@@ -349,6 +374,7 @@ def run_replay(rows: list[dict[str, Any]], config: dict[str, Any]) -> ReplaySumm
             quote_price=plan.price,
             win_prob=plan.win_prob,
             fill_prob=plan.fill_prob,
+            actual_fill_ratio=fill_ratio,
             filled_ev=plan.filled_ev,
             submitted_ev=plan.submitted_ev,
             realized_filled_pnl=realized_filled_pnl,
