@@ -13,7 +13,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import re
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -149,45 +148,89 @@ class PolymarketGammaClient:
         meta = entry.get("eventMetadata")
         if not isinstance(meta, dict):
             return {}
+        result: dict[str, float] = {}
+        try:
+            price_to_beat = float(meta["priceToBeat"])
+            if price_to_beat > 0:
+                result["official_opening_price"] = price_to_beat
+        except (KeyError, TypeError, ValueError):
+            pass
         try:
             final_price = float(meta["finalPrice"])
-            price_to_beat = float(meta["priceToBeat"])
+            if final_price > 0:
+                result["official_current_price"] = final_price
         except (KeyError, TypeError, ValueError):
-            return {}
-        return {
-            "official_current_price": final_price,
-            "official_opening_price": price_to_beat,
-            "fetched_at": time.time(),
-        }
+            pass
+        if result:
+            result["fetched_at"] = time.time()
+        return result
+
+    @staticmethod
+    def _price_match(left: float, right: float) -> bool:
+        if left <= 0 or right <= 0:
+            return False
+        tolerance = max(1e-6, max(abs(left), abs(right)) * 1e-8)
+        return abs(left - right) <= tolerance
+
+    @classmethod
+    def _extract_current_price_from_crypto_query(
+        cls,
+        queries: list[Any],
+        *,
+        opening_price: float,
+    ) -> float:
+        if opening_price <= 0:
+            return 0.0
+        for query in queries:
+            if not isinstance(query, dict):
+                continue
+            query_key = query.get("queryKey", [])
+            if not isinstance(query_key, list) or len(query_key) < 2:
+                continue
+            if query_key[0] != "crypto-prices" or query_key[1] != "price":
+                continue
+            state = query.get("state", {})
+            data = state.get("data")
+            if not isinstance(data, dict):
+                continue
+            try:
+                open_price = float(data.get("openPrice", 0) or 0)
+                close_price = float(data.get("closePrice", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if close_price <= 0:
+                continue
+            if cls._price_match(open_price, opening_price):
+                return close_price
+        return 0.0
 
     @classmethod
     def _parse_event_page_metadata(cls, slug: str, html: str) -> dict[str, float]:
         script_marker = '<script id="__NEXT_DATA__"'
         start_idx = html.find(script_marker)
         if start_idx < 0:
-            return cls._parse_event_page_metadata_fallback(html)
+            return {}
         json_start = html.find(">", start_idx)
         if json_start < 0:
-            return cls._parse_event_page_metadata_fallback(html)
+            return {}
         json_start += 1
         end_idx = html.find("</script>", json_start)
         if end_idx < 0:
-            return cls._parse_event_page_metadata_fallback(html)
+            return {}
 
         try:
             payload = json.loads(html[json_start:end_idx])
         except (json.JSONDecodeError, ValueError):
-            return cls._parse_event_page_metadata_fallback(html)
+            return {}
 
         page_props = payload.get("props", {}).get("pageProps", {})
+        metadata: dict[str, float] = {}
         data_list = page_props.get("data", [])
         if isinstance(data_list, list):
             for entry in data_list:
                 if not isinstance(entry, dict) or entry.get("slug") != slug:
                     continue
-                prices = cls._extract_prices_from_event_entry(entry)
-                if prices:
-                    return prices
+                metadata.update(cls._extract_prices_from_event_entry(entry))
 
         dehydrated = page_props.get("dehydratedState", {})
         queries = dehydrated.get("queries", [])
@@ -201,30 +244,23 @@ class PolymarketGammaClient:
                 for entry in candidates:
                     if not isinstance(entry, dict) or entry.get("slug") != slug:
                         continue
-                    prices = cls._extract_prices_from_event_entry(entry)
-                    if prices:
-                        return prices
+                    extracted = cls._extract_prices_from_event_entry(entry)
+                    if "official_opening_price" in extracted and "official_opening_price" not in metadata:
+                        metadata["official_opening_price"] = extracted["official_opening_price"]
+                    if "official_current_price" in extracted and "official_current_price" not in metadata:
+                        metadata["official_current_price"] = extracted["official_current_price"]
 
-        return cls._parse_event_page_metadata_fallback(html)
+            if "official_current_price" not in metadata and "official_opening_price" in metadata:
+                current_price = cls._extract_current_price_from_crypto_query(
+                    queries,
+                    opening_price=float(metadata["official_opening_price"]),
+                )
+                if current_price > 0:
+                    metadata["official_current_price"] = current_price
 
-    @staticmethod
-    def _parse_event_page_metadata_fallback(html: str) -> dict[str, float]:
-        match = re.search(
-            r'"eventMetadata"\s*:\s*\{[^{}]*"finalPrice"\s*:\s*([0-9.]+)[^{}]*"priceToBeat"\s*:\s*([0-9.]+)',
-            html,
-        )
-        if not match:
-            return {}
-        try:
-            final_price = float(match.group(1))
-            price_to_beat = float(match.group(2))
-        except (TypeError, ValueError):
-            return {}
-        return {
-            "official_current_price": final_price,
-            "official_opening_price": price_to_beat,
-            "fetched_at": time.time(),
-        }
+        if metadata:
+            metadata["fetched_at"] = time.time()
+        return metadata
 
     @staticmethod
     def _parse_list_field(raw: Any) -> list[Any]:

@@ -60,6 +60,41 @@ class PolymarketClientTests(unittest.TestCase):
         self.assertAlmostEqual(metadata["official_opening_price"], 66620.11899999999, places=6)
         self.assertGreater(metadata["fetched_at"], 0)
 
+    def test_event_page_metadata_parser_uses_crypto_prices_for_active_window(self):
+        html = """
+        <html><body>
+        <script id="__NEXT_DATA__" type="application/json">
+        {"props":{"pageProps":{
+            "data":[
+                {
+                    "slug":"btc-updown-15m-1775197800",
+                    "eventMetadata":{"priceToBeat":66624.16057626104}
+                }
+            ],
+            "dehydratedState":{"queries":[
+                {
+                    "queryKey":["crypto-prices","price","BTC","2026-04-03T06:30:00Z","fifteen","2026-04-03T06:45:00Z"],
+                    "state":{"data":{"openPrice":66624.16057626104,"closePrice":66731.98535437319}}
+                },
+                {
+                    "queryKey":["/api/series","btc-up-or-down-15m"],
+                    "state":{"data":[
+                        {
+                            "slug":"btc-updown-15m-1775137500",
+                            "eventMetadata":{"finalPrice":66252.9077185263,"priceToBeat":65844.48}
+                        }
+                    ]}
+                }
+            ]}
+        }}}
+        </script>
+        </body></html>
+        """
+        metadata = PolymarketGammaClient._parse_event_page_metadata("btc-updown-15m-1775197800", html)
+        self.assertAlmostEqual(metadata["official_opening_price"], 66624.16057626104, places=6)
+        self.assertAlmostEqual(metadata["official_current_price"], 66731.98535437319, places=6)
+        self.assertGreater(metadata["fetched_at"], 0)
+
     def test_orderbook_helpers_support_sdk_objects(self):
         client = PolymarketCLOBClient("test-key")
         client.get_orderbook = lambda token_id: BookObj(
