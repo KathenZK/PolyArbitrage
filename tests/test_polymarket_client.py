@@ -95,6 +95,30 @@ class PolymarketClientTests(unittest.TestCase):
         self.assertAlmostEqual(metadata["official_current_price"], 66731.98535437319, places=6)
         self.assertGreater(metadata["fetched_at"], 0)
 
+    def test_event_page_metadata_parser_uses_crypto_open_when_event_metadata_missing(self):
+        html = """
+        <html><body>
+        <script id="__NEXT_DATA__" type="application/json">
+        {"props":{"pageProps":{
+            "dehydratedState":{"queries":[
+                {
+                    "queryKey":["/api/event/slug","btc-updown-15m-1775202300"],
+                    "state":{"data":{"slug":"btc-updown-15m-1775202300","eventMetadata":null}}
+                },
+                {
+                    "queryKey":["crypto-prices","price","BTC","2026-04-03T07:45:00Z","fifteen","2026-04-03T08:00:00Z"],
+                    "state":{"data":{"openPrice":67079.95,"closePrice":null}}
+                }
+            ]}
+        }}}
+        </script>
+        </body></html>
+        """
+        metadata = PolymarketGammaClient._parse_event_page_metadata("btc-updown-15m-1775202300", html)
+        self.assertAlmostEqual(metadata["official_opening_price"], 67079.95, places=6)
+        self.assertNotIn("official_current_price", metadata)
+        self.assertGreater(metadata["fetched_at"], 0)
+
     def test_orderbook_helpers_support_sdk_objects(self):
         client = PolymarketCLOBClient("test-key")
         client.get_orderbook = lambda token_id: BookObj(

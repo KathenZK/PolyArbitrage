@@ -205,6 +205,48 @@ class PolymarketGammaClient:
         return 0.0
 
     @classmethod
+    def _extract_crypto_prices_window(
+        cls,
+        queries: list[Any],
+        *,
+        opening_price: float = 0.0,
+    ) -> tuple[float, float]:
+        fallback_open = 0.0
+        fallback_close = 0.0
+
+        for query in queries:
+            if not isinstance(query, dict):
+                continue
+            query_key = query.get("queryKey", [])
+            if not isinstance(query_key, list) or len(query_key) < 2:
+                continue
+            if query_key[0] != "crypto-prices" or query_key[1] != "price":
+                continue
+            state = query.get("state", {})
+            data = state.get("data")
+            if not isinstance(data, dict):
+                continue
+            try:
+                open_price = float(data.get("openPrice", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            close_raw = data.get("closePrice", 0)
+            try:
+                close_price = float(close_raw or 0)
+            except (TypeError, ValueError):
+                close_price = 0.0
+
+            if open_price <= 0:
+                continue
+            if fallback_open <= 0:
+                fallback_open = open_price
+                fallback_close = close_price
+            if opening_price > 0 and cls._price_match(open_price, opening_price):
+                return open_price, close_price
+
+        return fallback_open, fallback_close
+
+    @classmethod
     def _parse_event_page_metadata(cls, slug: str, html: str) -> dict[str, float]:
         script_marker = '<script id="__NEXT_DATA__"'
         start_idx = html.find(script_marker)
@@ -250,13 +292,14 @@ class PolymarketGammaClient:
                     if "official_current_price" in extracted and "official_current_price" not in metadata:
                         metadata["official_current_price"] = extracted["official_current_price"]
 
-            if "official_current_price" not in metadata and "official_opening_price" in metadata:
-                current_price = cls._extract_current_price_from_crypto_query(
-                    queries,
-                    opening_price=float(metadata["official_opening_price"]),
-                )
-                if current_price > 0:
-                    metadata["official_current_price"] = current_price
+            crypto_open, crypto_close = cls._extract_crypto_prices_window(
+                queries,
+                opening_price=float(metadata.get("official_opening_price", 0) or 0),
+            )
+            if "official_opening_price" not in metadata and crypto_open > 0:
+                metadata["official_opening_price"] = crypto_open
+            if "official_current_price" not in metadata and crypto_close > 0:
+                metadata["official_current_price"] = crypto_close
 
         if metadata:
             metadata["fetched_at"] = time.time()
