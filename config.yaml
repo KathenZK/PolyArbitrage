@@ -42,7 +42,10 @@ strategy:
   quote_max_spread_abs: 0.12       # reject token books wider than this; likely dust/stale
   quote_max_mid_deviation_abs: 0.10
   quote_extreme_edge_threshold: 0.02
-  allow_quote_fallback: true       # if token top-of-book is obviously bad, fall back to synthetic quote around token_price
+  allow_quote_fallback: true       # paper/replay may fall back to synthetic quote around token_price
+  live_require_executable_quote: true   # live mode refuses synthetic fallback quotes
+  entry_min_top_book_ratio: 1.0    # require top bid/ask notional >= planned entry notional
+  exit_min_top_bid_ratio: 1.0      # require top bid notional >= planned exit notional before taker sell
 
   # Exit: sell-first, redeem-fallback
   exit_enabled: true

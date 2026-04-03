@@ -33,6 +33,12 @@ class TokenBookSnapshot:
     best_ask: float
     spread: float
     tick_size: float
+    best_bid_size: float = 0.0
+    best_ask_size: float = 0.0
+    best_bid_notional: float = 0.0
+    best_ask_notional: float = 0.0
+    bid_depth_usd: float = 0.0
+    ask_depth_usd: float = 0.0
 
 
 class PolymarketGammaClient:
@@ -486,10 +492,20 @@ class PolymarketCLOBClient:
         asks = self._read_book_levels(book, "asks")
         best_bid = self._read_level_value(bids[0], "price") if bids else 0.0
         best_ask = self._read_level_value(asks[0], "price") if asks else 0.0
+        best_bid_size = self._read_level_value(bids[0], "size") if bids else 0.0
+        best_ask_size = self._read_level_value(asks[0], "size") if asks else 0.0
         if best_bid > 0 and best_ask > 0:
             spread = max(0.0, best_ask - best_bid)
         else:
             spread = 0.0
+        bid_depth_usd = sum(
+            self._read_level_value(level, "price") * self._read_level_value(level, "size")
+            for level in bids[:3]
+        )
+        ask_depth_usd = sum(
+            self._read_level_value(level, "price") * self._read_level_value(level, "size")
+            for level in asks[:3]
+        )
 
         tick_size = 0.01
         if isinstance(book, dict):
@@ -512,6 +528,12 @@ class PolymarketCLOBClient:
             best_ask=best_ask,
             spread=spread,
             tick_size=tick_size if tick_size > 0 else 0.01,
+            best_bid_size=best_bid_size,
+            best_ask_size=best_ask_size,
+            best_bid_notional=best_bid * best_bid_size,
+            best_ask_notional=best_ask * best_ask_size,
+            bid_depth_usd=bid_depth_usd,
+            ask_depth_usd=ask_depth_usd,
         )
 
     def get_order(self, order_id: str) -> Any:

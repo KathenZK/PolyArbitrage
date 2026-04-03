@@ -77,6 +77,12 @@ class PolymarketClientTests(unittest.TestCase):
         self.assertEqual(snapshot.best_ask, 0.63)
         self.assertAlmostEqual(snapshot.spread, 0.02, places=6)
         self.assertEqual(snapshot.tick_size, 0.01)
+        self.assertAlmostEqual(snapshot.best_bid_size, 10.0, places=6)
+        self.assertAlmostEqual(snapshot.best_ask_size, 12.0, places=6)
+        self.assertAlmostEqual(snapshot.best_bid_notional, 6.1, places=6)
+        self.assertAlmostEqual(snapshot.best_ask_notional, 7.56, places=6)
+        self.assertAlmostEqual(snapshot.bid_depth_usd, 10.9, places=6)
+        self.assertAlmostEqual(snapshot.ask_depth_usd, 10.12, places=6)
 
     def test_orderbook_helpers_support_dicts(self):
         client = PolymarketCLOBClient("test-key")
@@ -93,6 +99,8 @@ class PolymarketClientTests(unittest.TestCase):
         self.assertAlmostEqual(ask_depth, 3.57, places=6)
         snapshot = client.get_book_snapshot("token")
         self.assertEqual(snapshot.tick_size, 0.001)
+        self.assertAlmostEqual(snapshot.best_bid_notional, 2.4, places=6)
+        self.assertAlmostEqual(snapshot.best_ask_notional, 3.57, places=6)
 
     def test_client_init_passes_signature_type_funder_and_api_creds(self):
         events: list[tuple[str, object]] = []

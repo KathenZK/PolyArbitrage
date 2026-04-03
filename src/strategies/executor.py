@@ -128,6 +128,12 @@ class TokenQuote:
     tick_size: float
     source: str = "synthetic"
     executable_book: bool = False
+    best_bid_size: float = 0.0
+    best_ask_size: float = 0.0
+    best_bid_notional: float = 0.0
+    best_ask_notional: float = 0.0
+    bid_depth_usd: float = 0.0
+    ask_depth_usd: float = 0.0
 
 
 @dataclass
@@ -226,6 +232,9 @@ class Executor:
         quote_max_mid_deviation_abs: float = 0.10,
         quote_extreme_edge_threshold: float = 0.02,
         allow_quote_fallback: bool = True,
+        live_require_executable_quote: bool = True,
+        entry_min_top_book_ratio: float = 1.0,
+        exit_min_top_bid_ratio: float = 1.0,
         max_live_orders_per_day: int = 0,
         max_live_notional_usd_per_day: float = 0.0,
         max_consecutive_expired: int = 0,
@@ -259,6 +268,9 @@ class Executor:
         self._quote_max_mid_deviation_abs = quote_max_mid_deviation_abs
         self._quote_extreme_edge_threshold = quote_extreme_edge_threshold
         self._allow_quote_fallback = allow_quote_fallback
+        self._live_require_executable_quote = live_require_executable_quote
+        self._entry_min_top_book_ratio = entry_min_top_book_ratio
+        self._exit_min_top_bid_ratio = exit_min_top_bid_ratio
         self._max_live_orders_per_day = max_live_orders_per_day
         self._max_live_notional_usd_per_day = max_live_notional_usd_per_day
         self._max_consecutive_expired = max_consecutive_expired
@@ -410,6 +422,12 @@ class Executor:
                 tick_size=tick,
                 source=quote.source or "book",
                 executable_book=True,
+                best_bid_size=max(0.0, quote.best_bid_size),
+                best_ask_size=max(0.0, quote.best_ask_size),
+                best_bid_notional=max(0.0, quote.best_bid_notional),
+                best_ask_notional=max(0.0, quote.best_ask_notional),
+                bid_depth_usd=max(0.0, quote.bid_depth_usd),
+                ask_depth_usd=max(0.0, quote.ask_depth_usd),
             )
         if not self._allow_quote_fallback:
             return None
@@ -780,6 +798,25 @@ class Executor:
             executable_book=False,
         )
 
+    def _entry_quote_depth_ok(self, quote: TokenQuote, cost_usd: float) -> bool:
+        if cost_usd <= 0:
+            return True
+        if not quote.executable_book:
+            return False
+        required = cost_usd * max(self._entry_min_top_book_ratio, 0.0)
+        return (
+            quote.best_bid_notional + 1e-9 >= required
+            and quote.best_ask_notional + 1e-9 >= required
+        )
+
+    def _exit_quote_depth_ok(self, quote: TokenQuote, notional_usd: float) -> bool:
+        if notional_usd <= 0:
+            return True
+        if not quote.executable_book:
+            return False
+        required = notional_usd * max(self._exit_min_top_bid_ratio, 0.0)
+        return quote.best_bid_notional + 1e-9 >= required
+
     def _resolve_token_quote(
         self,
         token_id: str,
@@ -816,6 +853,12 @@ class Executor:
                         spread=max(0.0, spread),
                         tick_size=tick_size,
                         source="clob_book",
+                        best_bid_size=max(0.0, snapshot.best_bid_size),
+                        best_ask_size=max(0.0, snapshot.best_ask_size),
+                        best_bid_notional=max(0.0, snapshot.best_bid_notional),
+                        best_ask_notional=max(0.0, snapshot.best_ask_notional),
+                        bid_depth_usd=max(0.0, snapshot.bid_depth_usd),
+                        ask_depth_usd=max(0.0, snapshot.ask_depth_usd),
                     )
                     return self._sanitize_quote(token_id, token_price, quote) or self._fallback_token_quote(token_id, token_price, tick_size=tick_size)
             except Exception as exc:
@@ -1315,6 +1358,20 @@ class Executor:
         else:
             effective_bet = self._bet_size
 
+        if not self._dry_run and self._live_require_executable_quote and not quote.executable_book:
+            logger.debug(
+                f"Skip {signal.asset} {signal.direction.value}: "
+                f"live quote fallback disabled ({quote.source})"
+            )
+            return None
+        if not self._dry_run and not self._entry_quote_depth_ok(quote, effective_bet):
+            logger.debug(
+                f"Skip {signal.asset} {signal.direction.value}: "
+                f"top book too shallow for ${effective_bet:.2f} "
+                f"(bid_notional=${quote.best_bid_notional:.2f}, ask_notional=${quote.best_ask_notional:.2f})"
+            )
+            return None
+
         haircut = self._time_adjusted_haircut(secs_remaining)
         p_raw = signal.win_prob
         p = max(0.0, p_raw - haircut)
@@ -1469,6 +1526,9 @@ class Executor:
 
         shares = round(position.available_shares, 2)
         if shares < market.order_min_size:
+            return None
+        exit_notional = shares * quote.best_bid
+        if not self._dry_run and not self._exit_quote_depth_ok(quote, exit_notional):
             return None
 
         hold_prob = estimate.up_win_prob if position.direction == "UP" else estimate.down_win_prob

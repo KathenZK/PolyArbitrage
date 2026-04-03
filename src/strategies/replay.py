@@ -320,6 +320,9 @@ def run_replay(rows: list[dict[str, Any]], config: dict[str, Any]) -> ReplaySumm
         quote_max_mid_deviation_abs=strat.get("quote_max_mid_deviation_abs", 0.10),
         quote_extreme_edge_threshold=strat.get("quote_extreme_edge_threshold", 0.02),
         allow_quote_fallback=strat.get("allow_quote_fallback", True),
+        live_require_executable_quote=strat.get("live_require_executable_quote", True),
+        entry_min_top_book_ratio=strat.get("entry_min_top_book_ratio", 1.0),
+        exit_min_top_bid_ratio=strat.get("exit_min_top_bid_ratio", 1.0),
     )
     guard = SignalGuard(cooldown_secs=strat.get("signal_cooldown_sec", 120))
     calibrator = ProbabilityCalibrator(
