@@ -1,4 +1,4 @@
-"""Rich TUI 仪表盘，用于实时监控延迟套利流水线。"""
+"""Rich TUI 仪表盘，用于实时监控双源校准交易流水线。"""
 
 from __future__ import annotations
 
@@ -68,7 +68,7 @@ def build_header(pipeline: Pipeline) -> Panel:
     min_ev = strat.get("min_ev_usd", 0.10)
 
     t = Text(justify="center")
-    t.append("PolyArbitrage — 延迟套利", style="bold white")
+    t.append("PolyArbitrage — 双源校准策略", style="bold white")
     t.append(" | ", style="dim")
     t.append("模拟" if dry_run else "实盘", style="bold yellow" if dry_run else "bold red")
     t.append(" | ", style="dim")
@@ -257,8 +257,8 @@ def build_trades_table(pipeline: Pipeline) -> Table:
     table.add_column("品种", width=4)
     table.add_column("方向", width=5)
     table.add_column("状态", width=10)
-    table.add_column("成交", width=7, justify="right")
-    table.add_column("成交率", width=5, justify="right")
+    table.add_column("实成", width=7, justify="right")
+    table.add_column("保守下界", width=8, justify="right")
     table.add_column("报价", width=5, justify="right")
     table.add_column("胜率", width=5, justify="right")
     table.add_column("期望", width=7, justify="right")
@@ -373,10 +373,13 @@ def build_status_panel(pipeline: Pipeline) -> Panel:
     t.append("模拟" if dry_run else "实盘", style="bold yellow" if dry_run else "bold red")
     redeem_status = pipeline.redeemer.status()
     t.append("  赎回: ")
-    t.append(
-        "已激活" if redeem_status.armed else "关闭",
-        style="green" if redeem_status.armed else "yellow",
-    )
+    if dry_run:
+        t.append("模拟停用", style="dim")
+    else:
+        t.append(
+            "已激活" if redeem_status.armed else "关闭",
+            style="green" if redeem_status.armed else "yellow",
+        )
     t.append("\n")
 
     t.append(" ─── 今日限额 ───\n", style="dim")
@@ -459,7 +462,7 @@ def build_stats_panel(pipeline: Pipeline) -> Panel:
     )
 
     t.append(f" 平均胜率: {avg_p:.1%}" if filled else " 平均胜率: --")
-    t.append(f"  平均成交率: {avg_fill:.1%}\n" if trades else "  平均成交率: --\n")
+    t.append(f"  平均保守下界: {avg_fill:.1%}\n" if trades else "  平均保守下界: --\n")
 
     if trades:
         t.append(f" 置信度: {avg_conf:.1%}")

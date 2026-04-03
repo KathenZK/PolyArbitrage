@@ -1,4 +1,4 @@
-"""PolyArbitrage — Binance-Polymarket latency arbitrage pipeline.
+"""PolyArbitrage — Binance/Polymarket dual-source calibrated trading pipeline.
 
 Architecture:
   Binance aggTrade WS  →  PriceComparator (vs opening price)  →  SignalGuard  →  Executor
@@ -387,7 +387,7 @@ class Pipeline:
         symbols = self.config.get("strategy", {}).get("symbols", ["btcusdt"])
         self.start_time = time.time()
 
-        console.print("[bold blue]PolyArbitrage — 延迟套利系统[/bold blue]")
+        console.print("[bold blue]PolyArbitrage — 双源校准交易系统[/bold blue]")
         console.print(f"  模式:    {'模拟' if dry_run else '[bold red]实盘[/bold red]'}")
         console.print(f"  品种:    {[s.replace('usdt','').upper() for s in symbols]}")
         console.print(f"  下注:    ${self.config.get('strategy', {}).get('bet_size_usd', 15)}/笔")
