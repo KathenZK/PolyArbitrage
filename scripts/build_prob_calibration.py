@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from collections import defaultdict
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.strategies.momentum import ProbabilityCalibrator
 from src.strategies.replay import _settle_side, load_replay_rows, signal_from_row
