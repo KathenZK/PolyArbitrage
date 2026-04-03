@@ -4,6 +4,9 @@ The strategy trades a Polymarket event, not raw Binance spot. We therefore:
   - use Binance as the fast source for sub-second price moves
   - use Polymarket's Chainlink-derived `priceToBeat` and official current price
     snapshot as the settlement anchor
+  - when the live page omits official current price, degrade to
+    `official opening + Binance window return` instead of discarding the
+    whole window
 
 The probability model still uses a simple Brownian approximation:
 
@@ -160,6 +163,18 @@ class ProbabilityCalibrator:
         if self._path and self._path.exists():
             self._load()
 
+    @property
+    def path(self) -> str:
+        return str(self._path) if self._path else ""
+
+    @property
+    def loaded(self) -> bool:
+        return bool(self._buckets)
+
+    @property
+    def bucket_count(self) -> int:
+        return len(self._buckets)
+
     def _load(self):
         if not self._path:
             return
@@ -277,6 +292,18 @@ class PriceComparator:
             prior_strength=prob_calibration_prior_strength,
         )
 
+    @property
+    def calibration_loaded(self) -> bool:
+        return self._calibrator.loaded
+
+    @property
+    def calibration_bucket_count(self) -> int:
+        return self._calibrator.bucket_count
+
+    @property
+    def calibration_path(self) -> str:
+        return self._calibrator.path
+
     @staticmethod
     def _project_official_price(market: CryptoMarket, binance_price: float) -> float:
         if not market.has_official_calibration or binance_price <= 0:
@@ -292,6 +319,24 @@ class PriceComparator:
             blend = min(1.0, (cal_age - 30) / 60.0)
             projected = projected * (1 - blend) + binance_price * blend
         return projected
+
+    @staticmethod
+    def _project_from_official_anchor(market: CryptoMarket, binance_price: float) -> float:
+        """Fallback when only the official opening anchor is available.
+
+        This keeps the strategy aligned to the official event definition while
+        using Binance's within-window return as the fast proxy. It is weaker
+        than full dual-source calibration, but better than discarding the whole
+        window when Polymarket omits the live closePrice snapshot.
+        """
+        if (
+            not market.has_official_opening_price
+            or not market.has_opening_price
+            or market.opening_price <= 0
+            or binance_price <= 0
+        ):
+            return 0.0
+        return market.official_opening_price * (binance_price / market.opening_price)
 
     def estimate(self, binance_symbol: str, price: float, timestamp: float) -> MarketEstimate | None:
         if self._registry.in_transition:
@@ -315,6 +360,7 @@ class PriceComparator:
         projected_official_price = 0.0
         official_deviation = 0.0
         using_official = False
+        using_anchor_only = False
         cal_age = market.official_calibration_age
         if market.has_official_calibration and cal_age <= self._official_max_age:
             projected_official_price = self._project_official_price(market, price)
@@ -323,12 +369,20 @@ class PriceComparator:
                     projected_official_price - market.official_opening_price
                 ) / market.official_opening_price
                 using_official = True
+        elif market.has_official_opening_price and market.has_opening_price:
+            projected_official_price = self._project_from_official_anchor(market, price)
+            if projected_official_price > 0:
+                official_deviation = (
+                    projected_official_price - market.official_opening_price
+                ) / market.official_opening_price
+                using_official = True
+                using_anchor_only = True
 
         if not using_official and self._require_official_source:
             return None
 
         effective_deviation = official_deviation if using_official else binance_deviation
-        if using_official and market.has_opening_price:
+        if using_official and not using_anchor_only and market.has_opening_price:
             if (
                 abs(binance_deviation) >= self._threshold
                 and abs(official_deviation) >= self._threshold
@@ -343,7 +397,11 @@ class PriceComparator:
             realized = self._registry.realized_vol(binance_symbol)
             if realized > 0.10:
                 annual_vol = realized
-        source_gap = abs(binance_deviation - official_deviation) if using_official and market.has_opening_price else 0.0
+        source_gap = (
+            abs(binance_deviation - official_deviation)
+            if using_official and not using_anchor_only and market.has_opening_price
+            else 0.0
+        )
         same_side_prob, calibration_source, calibration_samples = calibrated_same_side_prob(
             asset=market.asset,
             deviation_abs=abs(effective_deviation),
@@ -373,7 +431,11 @@ class PriceComparator:
             current_price=current_price,
             opening_price=opening_price,
             effective_deviation_pct=effective_deviation,
-            price_source="dual_calibrated" if using_official else "binance_only",
+            price_source=(
+                "official_anchor_fast_return"
+                if using_anchor_only
+                else ("dual_calibrated" if using_official else "binance_only")
+            ),
             binance_deviation_pct=binance_deviation,
             official_deviation_pct=official_deviation,
             official_opening_price=market.official_opening_price,

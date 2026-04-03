@@ -391,6 +391,16 @@ class Pipeline:
         console.print(f"  模式:    {'模拟' if dry_run else '[bold red]实盘[/bold red]'}")
         console.print(f"  品种:    {[s.replace('usdt','').upper() for s in symbols]}")
         console.print(f"  下注:    ${self.config.get('strategy', {}).get('bet_size_usd', 15)}/笔")
+        if self.comparator.calibration_loaded:
+            console.print(
+                f"  校准:    [green]已加载[/green] "
+                f"({self.comparator.calibration_bucket_count} buckets)"
+            )
+        elif self.comparator.calibration_path:
+            console.print(
+                f"  校准:    [yellow]未加载[/yellow] "
+                f"({self.comparator.calibration_path} 缺失，当前使用 Brownian 先验)"
+            )
 
         if not dry_run:
             if not await self._run_live_preflight():

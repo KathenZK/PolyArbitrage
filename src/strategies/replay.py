@@ -186,6 +186,7 @@ def signal_from_row(
     projected_official_price = 0.0
     official_deviation = 0.0
     using_official = False
+    using_anchor_only = False
     row_ts = _parse_float(row, "recorded_at", _parse_float(row, "timestamp", time.time()))
     ref_ts = market.official_binance_ref_ts if market.official_binance_ref_ts > 0 else market.official_price_updated_at
     official_updated_at = market.official_price_updated_at
@@ -206,6 +207,18 @@ def signal_from_row(
             projected_official_price - market.official_opening_price
         ) / market.official_opening_price
         using_official = True
+    elif (
+        market.has_official_opening_price
+        and binance_opening > 0
+        and official_updated_at > 0
+        and official_updated_at <= row_ts + 1e-6
+    ):
+        projected_official_price = market.official_opening_price * (binance_price / binance_opening)
+        official_deviation = (
+            projected_official_price - market.official_opening_price
+        ) / market.official_opening_price
+        using_official = True
+        using_anchor_only = True
 
     if not using_official and require_official_source:
         return None
@@ -214,7 +227,7 @@ def signal_from_row(
     if abs(deviation) < threshold_pct:
         return None
 
-    if using_official and binance_opening > 0:
+    if using_official and not using_anchor_only and binance_opening > 0:
         if (
             abs(binance_deviation) >= threshold_pct
             and abs(official_deviation) >= threshold_pct
@@ -231,7 +244,11 @@ def signal_from_row(
         return None
     symbol = _symbol(row)
     annual_vol = (annual_vols or DEFAULT_ANNUAL_VOL).get(symbol, 0.70)
-    source_gap = abs(binance_deviation - official_deviation) if using_official and binance_opening > 0 else 0.0
+    source_gap = (
+        abs(binance_deviation - official_deviation)
+        if using_official and not using_anchor_only and binance_opening > 0
+        else 0.0
+    )
     same_side_prob, _, _ = calibrated_same_side_prob(
         asset=market.asset,
         deviation_abs=abs(deviation),
@@ -255,7 +272,11 @@ def signal_from_row(
         win_prob=win_prob,
         market=market,
         timestamp=timestamp,
-        price_source="dual_calibrated" if using_official else "binance_only",
+        price_source=(
+            "official_anchor_fast_return"
+            if using_anchor_only
+            else ("dual_calibrated" if using_official else "binance_only")
+        ),
         binance_deviation_pct=binance_deviation,
         official_deviation_pct=official_deviation,
         official_opening_price=market.official_opening_price,

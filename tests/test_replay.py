@@ -239,6 +239,56 @@ class ReplayTests(unittest.TestCase):
         self.assertEqual(summary.signals, 1)
         self.assertEqual(summary.trades, 1)
 
+    def test_replay_uses_official_open_anchor_when_official_current_missing(self):
+        config = {
+            "strategy": {
+                "symbols": ["btcusdt"],
+                "edge_threshold_pct": 0.003,
+                "min_secs_remaining": 30,
+                "min_secs_elapsed": 30,
+                "annual_vol_btcusdt": 0.60,
+                "signal_cooldown_sec": 120,
+                "bet_size_usd": 15,
+                "min_liquidity": 1000,
+                "min_ev_usd": 0.10,
+                "adverse_selection_haircut": 0.05,
+                "maker_offset_ticks": 1,
+                "fill_rate_prior": 0.35,
+                "require_official_source": True,
+                "official_max_age_sec": 15,
+                "max_source_divergence_pct": 0.01,
+            }
+        }
+        rows = [
+            {
+                "timestamp": 1_700_000_000,
+                "recorded_at": 1_700_000_000,
+                "symbol": "btcusdt",
+                "window_start": 1_699_999_900,
+                "binance_price": 100500,
+                "opening_price": 100000,
+                "official_opening_price": 99950,
+                "official_current_price": 0,
+                "official_price_updated_at": 1_699_999_995,
+                "up_price": 0.58,
+                "down_price": 0.42,
+                "up_best_bid": 0.57,
+                "up_best_ask": 0.59,
+                "up_book_fetch_ok": True,
+                "liquidity": 5000,
+                "secs_remaining": 600,
+                "secs_elapsed": 300,
+                "resolved_settle_side": "UP",
+                "actual_fill_ratio": 0.5,
+            },
+        ]
+
+        summary = run_replay(rows, config)
+
+        self.assertEqual(summary.signals, 1)
+        self.assertEqual(summary.trades, 1)
+        self.assertGreater(summary.expected_submitted_ev, 0)
+
     def test_dry_run_replay_uses_token_level_down_quote(self):
         config = {
             "strategy": {
