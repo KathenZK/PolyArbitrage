@@ -97,6 +97,7 @@ class SnapshotRecorder:
         self._running = False
 
     async def on_tick(self, tick: Tick):
+        recorded_at = time.time()
         self.registry.buffer_tick(tick.symbol, tick.price, tick.timestamp)
         self.registry.record_opening_price(tick.symbol, tick.price, tick.timestamp)
 
@@ -133,8 +134,17 @@ class SnapshotRecorder:
         if not self._should_snapshot(tick, market):
             return
 
-        up_book, down_book = await asyncio.to_thread(self._fetch_token_books, market)
-        row = self._build_snapshot_row(tick, market, up_book, down_book)
+        market_state = self._freeze_market_state(market)
+        up_book, down_book, up_book_ok, down_book_ok = await asyncio.to_thread(self._fetch_token_books, market)
+        row = self._build_snapshot_row(
+            tick,
+            market_state,
+            up_book,
+            down_book,
+            recorded_at=recorded_at,
+            up_book_ok=up_book_ok,
+            down_book_ok=down_book_ok,
+        )
         self._write_jsonl(self._snapshot_fp, row)
         self._last_snapshot_ts[tick.symbol] = tick.timestamp
         self._last_snapshot_price[tick.symbol] = tick.price
@@ -155,35 +165,12 @@ class SnapshotRecorder:
         move_pct = abs(tick.price - prev_price) / prev_price
         return move_pct >= self.min_price_move_pct
 
-    def _fetch_token_books(self, market) -> tuple[TokenBookSnapshot, TokenBookSnapshot]:
-        try:
-            up_book = self.clob.get_book_snapshot(market.up_token_id)
-        except Exception as exc:
-            logger.debug(f"Up book fetch failed for {market.up_token_id}: {exc}")
-            up_book = TokenBookSnapshot(market.up_token_id, 0.0, 0.0, 0.0, 0.01)
-        try:
-            down_book = self.clob.get_book_snapshot(market.down_token_id)
-        except Exception as exc:
-            logger.debug(f"Down book fetch failed for {market.down_token_id}: {exc}")
-            down_book = TokenBookSnapshot(market.down_token_id, 0.0, 0.0, 0.0, 0.01)
-        return up_book, down_book
-
-    def _build_snapshot_row(self, tick: Tick, market, up_book: TokenBookSnapshot, down_book: TokenBookSnapshot) -> dict:
-        deviation = 0.0
-        if market.has_opening_price and market.opening_price > 0:
-            deviation = (tick.price - market.opening_price) / market.opening_price
-
+    @staticmethod
+    def _freeze_market_state(market) -> dict:
         return {
-            "timestamp": tick.timestamp,
-            "symbol": tick.symbol,
             "asset": market.asset.upper(),
-            "binance_price": tick.price,
-            "quantity": tick.quantity,
-            "window_start": market.event_start,
             "event_start": market.event_start,
             "end_time": market.end_time,
-            "secs_remaining": max(0.0, market.end_time - tick.timestamp),
-            "secs_elapsed": max(0.0, tick.timestamp - market.event_start),
             "opening_price": market.opening_price,
             "has_opening_price": market.has_opening_price,
             "official_opening_price": market.official_opening_price,
@@ -191,7 +178,6 @@ class SnapshotRecorder:
             "official_binance_ref_price": market.official_binance_ref_price,
             "official_price_updated_at": market.official_price_updated_at,
             "official_binance_ref_ts": market.official_binance_ref_ts,
-            "deviation_pct": deviation,
             "market_id": market.market_id,
             "condition_id": market.condition_id,
             "market_slug": market.slug,
@@ -202,14 +188,6 @@ class SnapshotRecorder:
             "down_token_id": market.down_token_id,
             "up_price": market.up_price,
             "down_price": market.down_price,
-            "up_best_bid": up_book.best_bid,
-            "up_best_ask": up_book.best_ask,
-            "up_spread": up_book.spread,
-            "up_tick_size": up_book.tick_size,
-            "down_best_bid": down_book.best_bid,
-            "down_best_ask": down_book.best_ask,
-            "down_spread": down_book.spread,
-            "down_tick_size": down_book.tick_size,
             "best_bid": market.best_bid,
             "best_ask": market.best_ask,
             "spread": market.spread,
@@ -218,6 +196,117 @@ class SnapshotRecorder:
             "fee_rate": market.fee_rate,
             "fees_enabled": market.fees_enabled,
             "order_min_size": market.order_min_size,
+        }
+
+    def _fetch_token_books(self, market) -> tuple[TokenBookSnapshot, TokenBookSnapshot, bool, bool]:
+        up_ok = False
+        try:
+            up_book = self.clob.get_book_snapshot(market.up_token_id)
+            up_ok = True
+        except Exception as exc:
+            logger.debug(f"Up book fetch failed for {market.up_token_id}: {exc}")
+            up_book = TokenBookSnapshot(market.up_token_id, 0.0, 0.0, 0.0, 0.01)
+        down_ok = False
+        try:
+            down_book = self.clob.get_book_snapshot(market.down_token_id)
+            down_ok = True
+        except Exception as exc:
+            logger.debug(f"Down book fetch failed for {market.down_token_id}: {exc}")
+            down_book = TokenBookSnapshot(market.down_token_id, 0.0, 0.0, 0.0, 0.01)
+        return up_book, down_book, up_ok, down_ok
+
+    def _build_snapshot_row(
+        self,
+        tick: Tick,
+        market: dict,
+        up_book: TokenBookSnapshot,
+        down_book: TokenBookSnapshot,
+        *,
+        recorded_at: float,
+        up_book_ok: bool,
+        down_book_ok: bool,
+    ) -> dict:
+        deviation = 0.0
+        opening_price = float(market["opening_price"] or 0.0)
+        if market["has_opening_price"] and opening_price > 0:
+            deviation = (tick.price - opening_price) / opening_price
+
+        official_updated_at = float(market["official_price_updated_at"] or 0.0)
+        official_ref_ts = float(market["official_binance_ref_ts"] or 0.0)
+        official_age_sec = max(0.0, recorded_at - official_updated_at) if official_updated_at > 0 else 0.0
+        official_ref_age_sec = max(0.0, recorded_at - official_ref_ts) if official_ref_ts > 0 else 0.0
+        snapshot_quality = "full"
+        if not up_book_ok or not down_book_ok:
+            snapshot_quality = "book_partial"
+        if official_updated_at <= 0 or official_ref_ts <= 0:
+            snapshot_quality = "official_missing"
+        elif official_age_sec > self.registry._official_refresh_interval * 3:
+            snapshot_quality = "official_stale"
+
+        return {
+            "timestamp": tick.timestamp,
+            "tick_timestamp": tick.timestamp,
+            "recorded_at": recorded_at,
+            "symbol": tick.symbol,
+            "asset": market["asset"],
+            "binance_price": tick.price,
+            "quantity": tick.quantity,
+            "window_start": market["event_start"],
+            "event_start": market["event_start"],
+            "end_time": market["end_time"],
+            "secs_remaining": max(0.0, market["end_time"] - tick.timestamp),
+            "secs_elapsed": max(0.0, tick.timestamp - market["event_start"]),
+            "opening_price": opening_price,
+            "has_opening_price": market["has_opening_price"],
+            "official_opening_price": market["official_opening_price"],
+            "official_current_price": market["official_current_price"],
+            "official_binance_ref_price": market["official_binance_ref_price"],
+            "official_price_updated_at": official_updated_at,
+            "official_binance_ref_ts": official_ref_ts,
+            "official_age_sec": official_age_sec,
+            "official_ref_age_sec": official_ref_age_sec,
+            "deviation_pct": deviation,
+            "market_id": market["market_id"],
+            "condition_id": market["condition_id"],
+            "market_slug": market["market_slug"],
+            "question": market["question"],
+            "description": market["description"],
+            "resolution_source": market["resolution_source"],
+            "up_token_id": market["up_token_id"],
+            "down_token_id": market["down_token_id"],
+            "up_price": market["up_price"],
+            "down_price": market["down_price"],
+            "up_best_bid": up_book.best_bid,
+            "up_best_ask": up_book.best_ask,
+            "up_spread": up_book.spread,
+            "up_tick_size": up_book.tick_size,
+            "up_book_fetch_ok": up_book_ok,
+            "up_best_bid_size": up_book.best_bid_size,
+            "up_best_ask_size": up_book.best_ask_size,
+            "up_best_bid_notional": up_book.best_bid_notional,
+            "up_best_ask_notional": up_book.best_ask_notional,
+            "up_bid_depth_usd": up_book.bid_depth_usd,
+            "up_ask_depth_usd": up_book.ask_depth_usd,
+            "down_best_bid": down_book.best_bid,
+            "down_best_ask": down_book.best_ask,
+            "down_spread": down_book.spread,
+            "down_tick_size": down_book.tick_size,
+            "down_book_fetch_ok": down_book_ok,
+            "down_best_bid_size": down_book.best_bid_size,
+            "down_best_ask_size": down_book.best_ask_size,
+            "down_best_bid_notional": down_book.best_bid_notional,
+            "down_best_ask_notional": down_book.best_ask_notional,
+            "down_bid_depth_usd": down_book.bid_depth_usd,
+            "down_ask_depth_usd": down_book.ask_depth_usd,
+            "best_bid": market["best_bid"],
+            "best_ask": market["best_ask"],
+            "spread": market["spread"],
+            "volume": market["volume"],
+            "liquidity": market["liquidity"],
+            "fee_rate": market["fee_rate"],
+            "fees_enabled": market["fees_enabled"],
+            "order_min_size": market["order_min_size"],
+            "snapshot_quality": snapshot_quality,
         }
 
     def _finalize_previous_window(self, symbol: str, next_window_start: int):

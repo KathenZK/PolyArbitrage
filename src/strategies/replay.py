@@ -186,10 +186,15 @@ def signal_from_row(
     projected_official_price = 0.0
     official_deviation = 0.0
     using_official = False
-    row_ts = _parse_float(row, "timestamp", time.time())
+    row_ts = _parse_float(row, "recorded_at", _parse_float(row, "timestamp", time.time()))
     ref_ts = market.official_binance_ref_ts if market.official_binance_ref_ts > 0 else market.official_price_updated_at
+    official_updated_at = market.official_price_updated_at
+    future_official = (
+        (official_updated_at > 0 and official_updated_at > row_ts + 1e-6)
+        or (ref_ts > 0 and ref_ts > row_ts + 1e-6)
+    )
     cal_age = max(0.0, row_ts - ref_ts) if ref_ts > 0 else float("inf")
-    if market.has_official_calibration and cal_age <= official_max_age_secs:
+    if market.has_official_calibration and not future_official and cal_age <= official_max_age_secs:
         ratio = market.official_current_price / market.official_binance_ref_price
         raw_projection = binance_price * ratio
         if cal_age > 30:
@@ -220,6 +225,10 @@ def signal_from_row(
             return None
 
     direction = Direction.UP if deviation > 0 else Direction.DOWN
+    if direction == Direction.UP and "up_book_fetch_ok" in row and not bool(row.get("up_book_fetch_ok")):
+        return None
+    if direction == Direction.DOWN and "down_book_fetch_ok" in row and not bool(row.get("down_book_fetch_ok")):
+        return None
     symbol = _symbol(row)
     annual_vol = (annual_vols or DEFAULT_ANNUAL_VOL).get(symbol, 0.70)
     source_gap = abs(binance_deviation - official_deviation) if using_official and binance_opening > 0 else 0.0

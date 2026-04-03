@@ -169,6 +169,76 @@ class ReplayTests(unittest.TestCase):
         self.assertEqual(summary.trades, 1)
         self.assertGreater(summary.expected_submitted_ev, 0)
 
+    def test_replay_uses_recorded_at_for_official_age_and_blocks_future_official(self):
+        config = {
+            "strategy": {
+                "symbols": ["btcusdt"],
+                "edge_threshold_pct": 0.003,
+                "min_secs_remaining": 30,
+                "min_secs_elapsed": 30,
+                "annual_vol_btcusdt": 0.60,
+                "signal_cooldown_sec": 120,
+                "bet_size_usd": 15,
+                "min_liquidity": 1000,
+                "min_ev_usd": 0.10,
+                "adverse_selection_haircut": 0.05,
+                "maker_offset_ticks": 1,
+                "fill_rate_prior": 0.35,
+                "require_official_source": True,
+                "official_max_age_sec": 15,
+                "max_source_divergence_pct": 0.02,
+            }
+        }
+        rows = [
+            {
+                "timestamp": 1_700_000_000,
+                "recorded_at": 1_700_000_010,
+                "symbol": "btcusdt",
+                "window_start": 1_699_999_900,
+                "binance_price": 100300,
+                "opening_price": 100000,
+                "official_opening_price": 99900,
+                "official_current_price": 100250,
+                "official_binance_ref_price": 100200,
+                "official_price_updated_at": 1_700_000_008,
+                "official_binance_ref_ts": 1_700_000_008,
+                "up_price": 0.58,
+                "down_price": 0.42,
+                "best_bid": 0.57,
+                "best_ask": 0.59,
+                "liquidity": 5000,
+                "secs_remaining": 600,
+                "secs_elapsed": 300,
+                "resolved_settle_side": "UP",
+            },
+            {
+                "timestamp": 1_700_000_100,
+                "recorded_at": 1_700_000_100,
+                "symbol": "btcusdt",
+                "window_start": 1_699_999_900,
+                "binance_price": 100300,
+                "opening_price": 100000,
+                "official_opening_price": 99900,
+                "official_current_price": 100250,
+                "official_binance_ref_price": 100200,
+                "official_price_updated_at": 1_700_000_105,
+                "official_binance_ref_ts": 1_700_000_105,
+                "up_price": 0.58,
+                "down_price": 0.42,
+                "best_bid": 0.57,
+                "best_ask": 0.59,
+                "liquidity": 5000,
+                "secs_remaining": 600,
+                "secs_elapsed": 300,
+                "resolved_settle_side": "UP",
+            },
+        ]
+
+        summary = run_replay(rows, config)
+
+        self.assertEqual(summary.signals, 1)
+        self.assertEqual(summary.trades, 1)
+
     def test_dry_run_replay_uses_token_level_down_quote(self):
         config = {
             "strategy": {
@@ -256,6 +326,48 @@ class ReplayTests(unittest.TestCase):
         self.assertEqual(summary.trades, 1)
         self.assertEqual(summary.realized_submitted_pnl, 0.0)
         self.assertIsNone(summary.trade_log[0].realized_submitted_pnl)
+
+    def test_replay_skips_rows_with_missing_directional_book_fetch(self):
+        config = {
+            "strategy": {
+                "symbols": ["btcusdt"],
+                "edge_threshold_pct": 0.003,
+                "min_secs_remaining": 30,
+                "min_secs_elapsed": 30,
+                "annual_vol_btcusdt": 0.60,
+                "signal_cooldown_sec": 120,
+                "bet_size_usd": 15,
+                "min_liquidity": 1000,
+                "min_ev_usd": 0.10,
+                "adverse_selection_haircut": 0.05,
+                "maker_offset_ticks": 1,
+                "fill_rate_prior": 0.35,
+            }
+        }
+        rows = [
+            {
+                "timestamp": 1_700_000_000,
+                "recorded_at": 1_700_000_001,
+                "symbol": "btcusdt",
+                "window_start": 1_699_999_900,
+                "binance_price": 99000,
+                "opening_price": 100000,
+                "up_price": 0.62,
+                "down_price": 0.38,
+                "down_best_bid": 0.37,
+                "down_best_ask": 0.39,
+                "down_book_fetch_ok": False,
+                "liquidity": 5000,
+                "secs_remaining": 600,
+                "secs_elapsed": 300,
+                "resolved_settle_side": "DOWN",
+            },
+        ]
+
+        summary = run_replay(rows, config)
+
+        self.assertEqual(summary.signals, 0)
+        self.assertEqual(summary.trades, 0)
 
 
 if __name__ == "__main__":
