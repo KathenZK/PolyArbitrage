@@ -980,7 +980,9 @@ class Executor:
 
     def open_positions(self) -> list[OpenPosition]:
         rows: list[dict[str, Any]]
-        if self._db is not None:
+        # Paper mode should reflect the current in-memory simulation session,
+        # not historical rows persisted from prior runs.
+        if self._db is not None and not self._dry_run:
             rows = get_position_rows(self._db, is_paper=self._dry_run)
         else:
             buckets: dict[tuple[str, str, str, str, str, str, str], dict[str, Any]] = {}

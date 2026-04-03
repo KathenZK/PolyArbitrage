@@ -515,7 +515,7 @@ def build_funding_panel(pipeline: Pipeline) -> Panel:
     marked_value = 0.0
     for pos in positions:
         market = pipeline.registry.get_market(pos.binance_symbol)
-        if market is None:
+        if market is None or (pos.market_slug and market.slug != pos.market_slug):
             marked_value += pos.available_shares * pos.avg_entry_price
             continue
         token_price = market.up_price if pos.direction == "UP" else market.down_price
