@@ -105,6 +105,7 @@ class PriceComparator:
         official_max_age_secs: float = 90,
         max_source_divergence_pct: float = 0.0025,
         source_gap_penalty_mult: float = 8.0,
+        use_realized_vol: bool = False,
     ):
         self._registry = registry
         self._threshold = threshold_pct
@@ -115,6 +116,7 @@ class PriceComparator:
         self._official_max_age = official_max_age_secs
         self._max_source_divergence = max_source_divergence_pct
         self._source_gap_penalty_mult = source_gap_penalty_mult
+        self._use_realized_vol = use_realized_vol
 
     @staticmethod
     def _project_official_price(market: CryptoMarket, binance_price: float) -> float:
@@ -133,6 +135,9 @@ class PriceComparator:
         return projected
 
     def check(self, binance_symbol: str, price: float, timestamp: float) -> Signal | None:
+        if self._registry.in_transition:
+            return None
+
         market = self._registry.get_market(binance_symbol)
         if not market:
             return None
@@ -180,6 +185,10 @@ class PriceComparator:
         direction = Direction.UP if effective_deviation > 0 else Direction.DOWN
 
         annual_vol = self._vols.get(binance_symbol, 0.70)
+        if self._use_realized_vol:
+            realized = self._registry.realized_vol(binance_symbol)
+            if realized > 0.10:
+                annual_vol = realized
         win_prob = estimate_win_prob(abs(effective_deviation), remaining, annual_vol)
         source_gap = abs(binance_deviation - official_deviation) if using_official and market.has_opening_price else 0.0
         if using_official and source_gap > 0:

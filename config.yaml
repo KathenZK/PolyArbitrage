@@ -10,19 +10,27 @@ strategy:
   max_source_divergence_pct: 0.0025
   source_gap_penalty_mult: 8.0
 
-  # Probability model: annualized volatility per asset (for p estimation)
+  # Probability model: static fallback vols (overridden by realized vol when available)
   annual_vol_btcusdt: 0.60
   annual_vol_ethusdt: 0.75
   annual_vol_solusdt: 1.00
+
+  # Realized volatility: prefer live estimate from Binance tick stream
+  use_realized_vol: true
+  realized_vol_lookback_sec: 300   # 5-minute rolling window for vol estimation
+  realized_vol_min_ticks: 20       # minimum ticks required to trust realized vol
 
   # Signal guard: one trade per market window
   signal_cooldown_sec: 120
 
   # Execution: submit only if fill-adjusted EV = fill_prob × B × (p_adj / q - 1) >= min_ev_usd
-  bet_size_usd: 2
+  bet_size_usd: 5                  # must satisfy order_min_size × q; auto-scales via max_bet_multiplier
+  max_bet_multiplier: 2.5          # allow effective bet up to 2.5× base when min_order_size requires it
   min_liquidity: 1000
   min_ev_usd: 0.10                 # minimum real EV in USD to place a trade
-  adverse_selection_haircut: 0.05  # subtract 5% from p to account for adverse selection
+  adverse_selection_haircut: 0.05  # base haircut; increases toward settlement per time_ramp
+  adverse_selection_time_ramp_sec: 300  # haircut doubles linearly in last N seconds before settlement
+  fill_adverse_coeff: 0.03         # EV discount for fill-win probability correlation
   maker_offset_ticks: 1
   fill_rate_prior: 0.35            # prior maker fill ratio before enough live samples exist
   fill_min_samples: 20             # minimum resolved live orders before using empirical fill stats
@@ -41,7 +49,10 @@ risk:
   require_live_arm: true
   clob_heartbeat_interval_sec: 5
   max_live_orders_per_day: 4
-  max_live_notional_usd_per_day: 10
+  max_live_notional_usd_per_day: 20       # raised for bet_size=5
+  max_consecutive_expired: 8              # circuit breaker: pause after N consecutive expired/unfilled orders
+  circuit_breaker_cooldown_sec: 900       # 15-min cooldown after circuit breaker triggers
+  max_directional_exposure_usd: 15        # max pending+filled exposure per direction (UP/DOWN)
 
 redeem:
   enabled: true

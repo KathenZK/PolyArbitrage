@@ -43,5 +43,6 @@ class SignalGuard:
         return True
 
     def on_window_change(self):
-        """Call when a new 15-min window starts to reset slug tracking."""
+        """Call when a new 15-min window starts to reset all tracking."""
         self._traded_slugs.clear()
+        self._last.clear()

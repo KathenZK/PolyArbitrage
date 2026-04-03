@@ -10,6 +10,7 @@ CLOB client uses the official py-clob-client SDK with:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -257,18 +258,32 @@ class PolymarketGammaClient:
         }
 
     async def get_event_page_metadata(self, slug: str) -> dict[str, float]:
-        """Fetch the official event page metadata exposed to users.
+        """Fetch the official event page metadata with retry.
 
         Polymarket's event page embeds the current Chainlink-derived "finalPrice"
-        and the window's "priceToBeat". These are lighter-weight official anchors
-        than trying to integrate Chainlink Data Streams directly.
+        and the window's "priceToBeat". Retries once on failure to improve
+        reliability since this is HTML scraping of __NEXT_DATA__.
         """
         session = await self._ensure_session()
         url = f"{EVENT_PAGE_BASE}/{slug}"
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as r:
-            r.raise_for_status()
-            html = await r.text()
-        return self._parse_event_page_metadata(slug, html)
+        last_exc: Exception | None = None
+        for attempt in range(2):
+            try:
+                async with session.get(
+                    url, timeout=aiohttp.ClientTimeout(total=8)
+                ) as r:
+                    r.raise_for_status()
+                    html = await r.text()
+                result = self._parse_event_page_metadata(slug, html)
+                if result:
+                    return result
+            except Exception as exc:
+                last_exc = exc
+            if attempt == 0:
+                await asyncio.sleep(0.5)
+        if last_exc:
+            logger.debug(f"Event page metadata failed for {slug}: {last_exc}")
+        return {}
 
     async def get_resolved_truth(self, slug: str) -> dict[str, Any]:
         event = await self.get_event_by_slug(slug)

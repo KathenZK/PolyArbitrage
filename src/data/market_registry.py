@@ -20,6 +20,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
+from math import log, sqrt
 
 import aiohttp
 
@@ -30,6 +31,7 @@ logger = logging.getLogger(__name__)
 WINDOW_SECS = 900
 MAX_OPENING_PRICE_DELAY = 15
 TICK_BUFFER_SECS = 30
+_SECS_PER_YEAR = 365.25 * 24 * 3600
 
 
 def current_window_start() -> int:
@@ -143,6 +145,8 @@ class MarketRegistry:
         refresh_interval: float = 15,
         official_refresh_interval: float = 60,
         min_liquidity: float = 1000,
+        vol_lookback_sec: float = 300,
+        vol_min_ticks: int = 20,
     ):
         self._gamma = gamma
         self._assets = assets or ["btc", "eth", "sol"]
@@ -153,6 +157,10 @@ class MarketRegistry:
         self._running = False
         self._current_window: int = 0
         self._tick_buffer: dict[str, deque[tuple[float, float]]] = {}
+        self._vol_buffer: dict[str, deque[tuple[float, float]]] = {}
+        self._vol_lookback = vol_lookback_sec
+        self._vol_min_ticks = vol_min_ticks
+        self._in_transition = False
         self._on_window_change: list = []
         self._prefetched_events: dict[str, dict] = {}
 
@@ -168,6 +176,10 @@ class MarketRegistry:
     def market_count(self) -> int:
         return len(self._markets)
 
+    @property
+    def in_transition(self) -> bool:
+        return self._in_transition
+
     def get_market(self, binance_symbol: str) -> CryptoMarket | None:
         return self._markets.get(binance_symbol)
 
@@ -175,7 +187,7 @@ class MarketRegistry:
         self._on_window_change.append(cb)
 
     def buffer_tick(self, binance_symbol: str, price: float, tick_ts: float):
-        """Buffer a Binance tick for opening price recovery. Called on every tick."""
+        """Buffer a Binance tick for opening price recovery and vol estimation."""
         if binance_symbol not in self._tick_buffer:
             self._tick_buffer[binance_symbol] = deque()
         buf = self._tick_buffer[binance_symbol]
@@ -183,6 +195,39 @@ class MarketRegistry:
         cutoff = tick_ts - TICK_BUFFER_SECS
         while buf and buf[0][0] < cutoff:
             buf.popleft()
+
+        if binance_symbol not in self._vol_buffer:
+            self._vol_buffer[binance_symbol] = deque()
+        vol_buf = self._vol_buffer[binance_symbol]
+        vol_buf.append((tick_ts, price))
+        vol_cutoff = tick_ts - self._vol_lookback
+        while vol_buf and vol_buf[0][0] < vol_cutoff:
+            vol_buf.popleft()
+
+    def realized_vol(self, binance_symbol: str) -> float:
+        """Annualized realized volatility from recent tick stream (sum-of-squared-log-returns)."""
+        buf = self._vol_buffer.get(binance_symbol)
+        if not buf or len(buf) < self._vol_min_ticks:
+            return 0.0
+
+        prices = list(buf)
+        n = len(prices)
+        total_span = prices[-1][0] - prices[0][0]
+        if total_span <= 0:
+            return 0.0
+
+        sum_sq = 0.0
+        count = 0
+        for i in range(1, n):
+            if prices[i - 1][1] > 0 and prices[i][1] > 0:
+                lr = log(prices[i][1] / prices[i - 1][1])
+                sum_sq += lr * lr
+                count += 1
+
+        if count < 5:
+            return 0.0
+
+        return sqrt(sum_sq * _SECS_PER_YEAR / total_span)
 
     def record_opening_price(self, binance_symbol: str, price: float, tick_ts: float):
         """Try to set the opening price from a live tick or the buffer."""
@@ -261,6 +306,7 @@ class MarketRegistry:
         new_window = ws != self._current_window
 
         if new_window:
+            self._in_transition = True
             for cb in self._on_window_change:
                 try:
                     cb()
@@ -312,6 +358,7 @@ class MarketRegistry:
                 logger.warning(f"Error fetching {slug}: {e}")
 
         self._current_window = ws
+        self._in_transition = False
 
         stale = [
             m for m in self._markets.values()

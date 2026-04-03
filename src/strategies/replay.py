@@ -257,9 +257,14 @@ def _settle_side(row: dict[str, Any], opening_price: float) -> str | None:
     )
     if final_price in (None, ""):
         return None
-    resolved_open = row.get("resolved_official_opening_price", row.get("resolved_opening_price", opening_price))
+    resolved_open = (
+        row.get("resolved_official_opening_price")
+        or row.get("resolved_opening_price")
+        or row.get("official_opening_price")
+        or row.get("price_to_beat")
+    )
     try:
-        base = float(resolved_open or opening_price)
+        base = float(resolved_open) if resolved_open else opening_price
         final = float(final_price)
     except (TypeError, ValueError):
         return None
@@ -290,6 +295,9 @@ def run_replay(rows: list[dict[str, Any]], config: dict[str, Any]) -> ReplaySumm
         min_ev_usd=strat.get("min_ev_usd", 0.10),
         maker_offset_ticks=strat.get("maker_offset_ticks", 1),
         adverse_selection_haircut=strat.get("adverse_selection_haircut", 0.05),
+        adverse_selection_time_ramp_sec=strat.get("adverse_selection_time_ramp_sec", 300),
+        fill_adverse_coeff=strat.get("fill_adverse_coeff", 0.03),
+        max_bet_multiplier=strat.get("max_bet_multiplier", 2.5),
         fill_rate_prior=strat.get("fill_rate_prior", 0.35),
         fill_min_samples=strat.get("fill_min_samples", 20),
         fill_lookback_hours=strat.get("fill_lookback_hours", 168),

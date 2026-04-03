@@ -66,6 +66,8 @@ class Pipeline:
             refresh_interval=strat.get("registry_refresh_sec", 15),
             official_refresh_interval=strat.get("official_refresh_sec", 60),
             min_liquidity=strat.get("min_liquidity", 1000),
+            vol_lookback_sec=strat.get("realized_vol_lookback_sec", 300),
+            vol_min_ticks=strat.get("realized_vol_min_ticks", 20),
         )
         annual_vols = {}
         for sym in strat.get("symbols", []):
@@ -83,17 +85,22 @@ class Pipeline:
             official_max_age_secs=strat.get("official_max_age_sec", 90),
             max_source_divergence_pct=strat.get("max_source_divergence_pct", 0.0025),
             source_gap_penalty_mult=strat.get("source_gap_penalty_mult", 8.0),
+            use_realized_vol=strat.get("use_realized_vol", False),
         )
         self.guard = SignalGuard(
             cooldown_secs=strat.get("signal_cooldown_sec", 120),
         )
+        risk = config.get("risk", {})
         self.executor = Executor(
             bet_size_usd=strat.get("bet_size_usd", 15),
-            dry_run=config.get("risk", {}).get("dry_run", True),
+            dry_run=risk.get("dry_run", True),
             min_liquidity=strat.get("min_liquidity", 1000),
             min_ev_usd=strat.get("min_ev_usd", 0.10),
             maker_offset_ticks=strat.get("maker_offset_ticks", 1),
             adverse_selection_haircut=strat.get("adverse_selection_haircut", 0.05),
+            adverse_selection_time_ramp_sec=strat.get("adverse_selection_time_ramp_sec", 300),
+            fill_adverse_coeff=strat.get("fill_adverse_coeff", 0.03),
+            max_bet_multiplier=strat.get("max_bet_multiplier", 2.5),
             fill_rate_prior=strat.get("fill_rate_prior", 0.35),
             fill_min_samples=strat.get("fill_min_samples", 20),
             fill_lookback_hours=strat.get("fill_lookback_hours", 168),
@@ -101,8 +108,11 @@ class Pipeline:
             fill_prior_strength=strat.get("fill_prior_strength", 12),
             fill_confidence_scale=strat.get("fill_confidence_scale", 8),
             fill_lower_bound_z=strat.get("fill_lower_bound_z", 1.0),
-            max_live_orders_per_day=config.get("risk", {}).get("max_live_orders_per_day", 0),
-            max_live_notional_usd_per_day=config.get("risk", {}).get("max_live_notional_usd_per_day", 0.0),
+            max_live_orders_per_day=risk.get("max_live_orders_per_day", 0),
+            max_live_notional_usd_per_day=risk.get("max_live_notional_usd_per_day", 0.0),
+            max_consecutive_expired=risk.get("max_consecutive_expired", 0),
+            circuit_breaker_cooldown_sec=risk.get("circuit_breaker_cooldown_sec", 900),
+            max_directional_exposure_usd=risk.get("max_directional_exposure_usd", 0.0),
         )
         redeem_cfg = config.get("redeem", {})
         self.redeemer = ProxyRedeemer(

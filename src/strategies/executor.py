@@ -186,6 +186,9 @@ class Executor:
         min_ev_usd: float = 0.10,
         maker_offset_ticks: int = 1,
         adverse_selection_haircut: float = 0.05,
+        adverse_selection_time_ramp_sec: float = 300.0,
+        fill_adverse_coeff: float = 0.03,
+        max_bet_multiplier: float = 2.5,
         reconcile_interval_secs: float = 2.0,
         fill_rate_prior: float = 0.35,
         fill_min_samples: int = 20,
@@ -196,6 +199,9 @@ class Executor:
         fill_lower_bound_z: float = 1.0,
         max_live_orders_per_day: int = 0,
         max_live_notional_usd_per_day: float = 0.0,
+        max_consecutive_expired: int = 0,
+        circuit_breaker_cooldown_sec: float = 900.0,
+        max_directional_exposure_usd: float = 0.0,
     ):
         self._bet_size = bet_size_usd
         self._dry_run = dry_run
@@ -203,6 +209,9 @@ class Executor:
         self._min_ev = min_ev_usd
         self._maker_offset_ticks = maker_offset_ticks
         self._haircut = adverse_selection_haircut
+        self._haircut_ramp_sec = adverse_selection_time_ramp_sec
+        self._fill_adverse_coeff = fill_adverse_coeff
+        self._max_bet_multiplier = max_bet_multiplier
         self._reconcile_interval = reconcile_interval_secs
         self._fill_rate_prior = fill_rate_prior
         self._fill_min_samples = fill_min_samples
@@ -213,6 +222,9 @@ class Executor:
         self._fill_lower_bound_z = fill_lower_bound_z
         self._max_live_orders_per_day = max_live_orders_per_day
         self._max_live_notional_usd_per_day = max_live_notional_usd_per_day
+        self._max_consecutive_expired = max_consecutive_expired
+        self._circuit_breaker_cooldown = circuit_breaker_cooldown_sec
+        self._max_directional_exposure = max_directional_exposure_usd
         self._clob = None
         self._db = None
         self._orders: list[TradeResult] = []
@@ -220,6 +232,10 @@ class Executor:
         self._skipped_low_ev = 0
         self._skipped_no_edge = 0
         self._skipped_live_limits = 0
+        self._skipped_circuit_breaker = 0
+        self._skipped_bet_size = 0
+        self._consecutive_expired = 0
+        self._circuit_breaker_until = 0.0
         self._last_reconcile = 0.0
         self._last_clob_heartbeat = 0.0
         self._heartbeat_id = ""
@@ -257,6 +273,14 @@ class Executor:
     @property
     def skipped_live_limits(self) -> int:
         return self._skipped_live_limits
+
+    @property
+    def skipped_circuit_breaker(self) -> int:
+        return self._skipped_circuit_breaker
+
+    @property
+    def skipped_bet_size(self) -> int:
+        return self._skipped_bet_size
 
     @property
     def recent_trades(self) -> list[TradeResult]:
@@ -612,6 +636,29 @@ class Executor:
             issues=issues,
             warnings=warnings,
         )
+
+    def _time_adjusted_haircut(self, secs_remaining: float) -> float:
+        """Adverse selection increases as settlement approaches."""
+        if secs_remaining >= self._haircut_ramp_sec:
+            return self._haircut
+        ramp = max(0.0, 1.0 - secs_remaining / self._haircut_ramp_sec)
+        return self._haircut * (1.0 + ramp)
+
+    def _active_directional_exposure(self) -> dict[str, float]:
+        """Total outstanding exposure per direction across recent orders."""
+        exposure: dict[str, float] = {"UP": 0.0, "DOWN": 0.0}
+        cutoff = time.time() - 900
+        for trade in self._orders:
+            if trade.timestamp < cutoff:
+                continue
+            direction = trade.direction.upper()
+            if direction not in exposure:
+                continue
+            if trade.status == OrderStatus.PENDING:
+                exposure[direction] += trade.cost_usd
+            elif trade.status == OrderStatus.FILLED:
+                exposure[direction] += trade.matched_cost_usd
+        return exposure
 
     def _fallback_token_quote(self, token_id: str, token_price: float) -> TokenQuote:
         tick_size = 0.01
@@ -995,6 +1042,20 @@ class Executor:
             self._persist_trade(trade, raw_data=payload)
             updated += 1
 
+            if new_status == OrderStatus.EXPIRED and new_matched_shares <= 0:
+                self._consecutive_expired += 1
+                if (
+                    self._max_consecutive_expired > 0
+                    and self._consecutive_expired >= self._max_consecutive_expired
+                ):
+                    self._circuit_breaker_until = time.time() + self._circuit_breaker_cooldown
+                    logger.warning(
+                        f"Circuit breaker triggered: {self._consecutive_expired} consecutive "
+                        f"expired orders, pausing for {self._circuit_breaker_cooldown:.0f}s"
+                    )
+            elif new_status == OrderStatus.FILLED and new_matched_shares > 0:
+                self._consecutive_expired = 0
+
             logger.info(
                 f"Order {trade.order_id} -> {trade.display_status} "
                 f"filled={trade.matched_shares:.2f}/{trade.shares:.2f}"
@@ -1014,6 +1075,14 @@ class Executor:
             if count_skips:
                 self._skipped_low_liq += 1
             return None
+
+        if self._circuit_breaker_until > 0:
+            if time.time() < self._circuit_breaker_until:
+                if count_skips:
+                    self._skipped_circuit_breaker += 1
+                return None
+            self._circuit_breaker_until = 0.0
+            self._consecutive_expired = 0
 
         if signal.direction == Direction.UP:
             token_id = market.up_token_id
@@ -1043,19 +1112,27 @@ class Executor:
         spread = quote.spread if quote.spread > 0 else max(tick_size, best_ask - best_bid)
         secs_remaining = market.secs_remaining
 
+        shares = self._bet_size / q
+        if shares < market.order_min_size:
+            shares = float(market.order_min_size)
+            effective_bet = shares * q
+            if effective_bet > self._bet_size * self._max_bet_multiplier:
+                if count_skips:
+                    self._skipped_bet_size += 1
+                return None
+        else:
+            effective_bet = self._bet_size
+
+        haircut = self._time_adjusted_haircut(secs_remaining)
         p_raw = signal.win_prob
-        p = max(0.0, p_raw - self._haircut)
+        p = max(0.0, p_raw - haircut)
         if p <= q:
             if count_skips:
                 self._skipped_no_edge += 1
             logger.debug(
                 f"Skip {signal.asset} {signal.direction.value}: "
-                f"p={p:.3f} <= q={q:.3f} after {self._haircut:.0%} haircut"
+                f"p={p:.3f} <= q={q:.3f} after {haircut:.1%} haircut"
             )
-            return None
-
-        shares = self._bet_size / q
-        if shares < market.order_min_size:
             return None
 
         if not self._dry_run and enforce_live_limits:
@@ -1070,18 +1147,29 @@ class Executor:
                 return None
             if (
                 self._max_live_notional_usd_per_day > 0
-                and live_notional_today + self._bet_size > self._max_live_notional_usd_per_day + 1e-9
+                and live_notional_today + effective_bet > self._max_live_notional_usd_per_day + 1e-9
             ):
                 if count_skips:
                     self._skipped_live_limits += 1
                 logger.warning(
                     f"Skip live trade: daily notional cap reached "
-                    f"(${live_notional_today:.2f} + ${self._bet_size:.2f} > "
+                    f"(${live_notional_today:.2f} + ${effective_bet:.2f} > "
                     f"${self._max_live_notional_usd_per_day:.2f})"
                 )
                 return None
 
-        filled_ev = self._bet_size * (p / q - 1)
+        if self._max_directional_exposure > 0:
+            exposure = self._active_directional_exposure()
+            if exposure.get(signal.direction.value, 0.0) + effective_bet > self._max_directional_exposure:
+                if count_skips:
+                    self._skipped_live_limits += 1
+                logger.debug(
+                    f"Skip {signal.asset} {signal.direction.value}: "
+                    f"directional exposure ${exposure.get(signal.direction.value, 0.0):.2f} "
+                    f"+ ${effective_bet:.2f} > cap ${self._max_directional_exposure:.2f}"
+                )
+                return None
+
         fill_estimate = self._estimate_fill_ratio(
             asset=signal.asset,
             market=market,
@@ -1089,6 +1177,19 @@ class Executor:
             queue_ticks=queue_ticks,
             spread=spread,
         )
+
+        fill_discount = self._fill_adverse_coeff * fill_estimate.conservative_fill_ratio
+        p_conditional = max(0.0, p - fill_discount)
+        if p_conditional <= q:
+            if count_skips:
+                self._skipped_no_edge += 1
+            logger.debug(
+                f"Skip {signal.asset} {signal.direction.value}: "
+                f"p_cond={p_conditional:.3f} <= q={q:.3f} after fill-adverse discount"
+            )
+            return None
+
+        filled_ev = effective_bet * (p_conditional / q - 1)
         submitted_ev = filled_ev * fill_estimate.conservative_fill_ratio
         taker_fee = calc_taker_fee(shares, q, market.fee_rate)
 
@@ -1100,7 +1201,7 @@ class Executor:
                 f"submitted_EV ${submitted_ev:.2f} < ${self._min_ev:.2f} "
                 f"(filled_EV=${filled_ev:.2f}, "
                 f"fill~{fill_estimate.expected_fill_ratio:.1%}/lb {fill_estimate.conservative_fill_ratio:.1%}, "
-                f"p={p:.3f}, q={q:.2f})"
+                f"p_cond={p_conditional:.3f}, q={q:.2f})"
             )
             return None
 
@@ -1114,8 +1215,8 @@ class Executor:
             token_id=token_id,
             price=q,
             shares=shares,
-            cost_usd=self._bet_size,
-            win_prob=p,
+            cost_usd=effective_bet,
+            win_prob=p_conditional,
             expected_fill_ratio=fill_estimate.expected_fill_ratio,
             fill_ratio_lower_bound=fill_estimate.conservative_fill_ratio,
             fill_confidence=fill_estimate.confidence,
@@ -1147,8 +1248,11 @@ class Executor:
 
         if self._dry_run:
             order_id = f"paper-{len(self._orders) + 1}"
-            sim_fill_ratio = min(1.0, plan.expected_fill_ratio + random.uniform(-0.10, 0.10))
-            sim_fill_ratio = max(0.0, sim_fill_ratio)
+            alpha = max(0.3, plan.expected_fill_ratio * 2)
+            beta_param = max(0.3, (1 - plan.expected_fill_ratio) * 2)
+            sim_fill_ratio = random.betavariate(alpha, beta_param)
+            if sim_fill_ratio < 0.01:
+                sim_fill_ratio = 0.0
             matched_shares = round(plan.shares * sim_fill_ratio, 6)
             matched_cost_usd = round(matched_shares * plan.price, 6)
             status = OrderStatus.FILLED if matched_shares > 0 else OrderStatus.EXPIRED
