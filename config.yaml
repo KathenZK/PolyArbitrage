@@ -28,7 +28,7 @@ strategy:
   max_win_prob: 0.92               # never claim >92% certainty regardless of model output
 
   # Execution: submit only if fill-adjusted EV = fill_prob × B × (p_adj / q - 1) >= min_ev_usd
-  bet_size_usd: 5                  # must satisfy order_min_size × q; auto-scales via max_bet_multiplier
+  bet_size_usd: 2                  # must satisfy order_min_size × q; auto-scales via max_bet_multiplier
   max_bet_multiplier: 2.5          # allow effective bet up to 2.5× base when min_order_size requires it
   min_liquidity: 1000
   min_ev_usd: 0.10                 # minimum real EV in USD to place a trade
