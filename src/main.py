@@ -32,6 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.data.binance_stream import BinanceStream, Tick
 from src.data.market_registry import MarketRegistry
 from src.data.polymarket_client import PolymarketGammaClient
+from src.data.polymarket_rtds import PolymarketRTDSStream, RTDSPriceUpdate
 from src.execution.redeemer import ProxyRedeemer
 from src.output.alerts import DingTalkAlert
 from src.output.db import get_connection, init_db
@@ -149,6 +150,10 @@ class Pipeline:
 
         symbols = strat.get("symbols", ["btcusdt", "ethusdt", "solusdt"])
         self.stream = BinanceStream(symbols=symbols, on_tick=self._on_tick)
+        self.rtds = PolymarketRTDSStream(
+            chainlink_symbols=self.registry.chainlink_symbols,
+            on_chainlink_price=self._on_chainlink_price,
+        )
 
         self.signals: list[Signal] = []
         self.ticks_count = 0
@@ -183,6 +188,9 @@ class Pipeline:
 
         self.guards_passed += 1
         asyncio.create_task(self._execute(signal))
+
+    async def _on_chainlink_price(self, update: RTDSPriceUpdate):
+        self.registry.apply_chainlink_price(update.symbol, update.value, update.timestamp)
 
     async def _execute(self, signal: Signal):
         try:
@@ -425,6 +433,7 @@ class Pipeline:
         self.redeemer.attach_clob(self.executor._clob)
 
         stream_task = asyncio.create_task(self.stream.run())
+        rtds_task = asyncio.create_task(self.rtds.run())
         reconcile_task = asyncio.create_task(self._reconcile_loop())
         exit_task = asyncio.create_task(self._exit_loop())
         redeem_task = asyncio.create_task(self._redeem_loop()) if not dry_run else None
@@ -446,6 +455,7 @@ class Pipeline:
         finally:
             registry_task.cancel()
             stream_task.cancel()
+            rtds_task.cancel()
             reconcile_task.cancel()
             exit_task.cancel()
             if redeem_task is not None:
@@ -478,6 +488,7 @@ class Pipeline:
         if not dry_run:
             await self.executor.send_heartbeat(force=True)
         self.redeemer.attach_clob(self.executor._clob)
+        rtds_task = asyncio.create_task(self.rtds.run())
         reconcile_task = asyncio.create_task(self._reconcile_loop())
         exit_task = asyncio.create_task(self._exit_loop())
         redeem_task = asyncio.create_task(self._redeem_loop()) if not dry_run else None
@@ -493,6 +504,7 @@ class Pipeline:
             await self.stream.run()
         finally:
             registry_task.cancel()
+            rtds_task.cancel()
             reconcile_task.cancel()
             exit_task.cancel()
             if redeem_task is not None:
@@ -506,6 +518,7 @@ class Pipeline:
 
     async def shutdown(self):
         self.stream.stop()
+        self.rtds.stop()
         self.registry.stop()
         await self.alerts.close()
         await self.gamma.close()

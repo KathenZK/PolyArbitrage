@@ -2,8 +2,9 @@
 
 Two reference layers are tracked per market:
   - fast source: Binance ticks, used for sub-second movement
-  - official source: Polymarket event metadata derived from Chainlink, used as
-    the settlement anchor (`priceToBeat`) and current official price snapshot
+  - official source:
+      - opening anchor from Polymarket event metadata (`priceToBeat`)
+      - current price from Polymarket RTDS `crypto_prices_chainlink`
 
 Opening price tracking:
   - buffers recent Binance ticks per symbol (last ``TICK_BUFFER_SECS`` seconds)
@@ -49,6 +50,17 @@ ASSETS: dict[str, str] = {
     "eth": "ethusdt",
     "sol": "solusdt",
     "xrp": "xrpusdt",
+}
+CHAINLINK_SYMBOLS: dict[str, str] = {
+    "btc": "btc/usd",
+    "eth": "eth/usd",
+    "sol": "sol/usd",
+    "xrp": "xrp/usd",
+}
+CHAINLINK_TO_BINANCE: dict[str, str] = {
+    chainlink_symbol: ASSETS[asset]
+    for asset, chainlink_symbol in CHAINLINK_SYMBOLS.items()
+    if asset in ASSETS
 }
 
 @dataclass
@@ -166,6 +178,15 @@ class MarketRegistry:
         self._in_transition = False
         self._on_window_change: list = []
         self._prefetched_events: dict[str, dict] = {}
+
+    @property
+    def chainlink_symbols(self) -> list[str]:
+        symbols: list[str] = []
+        for asset_key in self._assets:
+            chainlink_symbol = CHAINLINK_SYMBOLS.get(asset_key)
+            if chainlink_symbol:
+                symbols.append(chainlink_symbol)
+        return symbols
 
     @property
     def markets(self) -> dict[str, CryptoMarket]:
@@ -295,6 +316,23 @@ class MarketRegistry:
             return 0.0
         return float(buf[-1][1] or 0.0)
 
+    def apply_chainlink_price(self, chainlink_symbol: str, price: float, price_ts: float):
+        """Apply RTDS Chainlink current price to the active market for an asset."""
+        if price <= 0:
+            return
+        binance_symbol = CHAINLINK_TO_BINANCE.get(str(chainlink_symbol or "").lower())
+        if not binance_symbol:
+            return
+        market = self._markets.get(binance_symbol)
+        if market is None:
+            return
+        market.official_current_price = price
+        market.official_price_updated_at = price_ts
+        latest_binance = self._latest_buffered_price(binance_symbol)
+        if latest_binance > 0:
+            market.official_binance_ref_price = latest_binance
+            market.official_binance_ref_ts = price_ts
+
     async def _refresh_official_metadata(self, market: CryptoMarket):
         try:
             metadata = await asyncio.wait_for(
@@ -306,18 +344,8 @@ class MarketRegistry:
             return
 
         opening = float(metadata.get("official_opening_price", 0) or 0)
-        current = float(metadata.get("official_current_price", 0) or 0)
         if opening > 0:
             market.official_opening_price = opening
-        if current > 0:
-            market.official_current_price = current
-        if opening > 0 or current > 0:
-            market.official_price_updated_at = float(metadata.get("fetched_at", time.time()) or time.time())
-
-        latest_binance = self._latest_buffered_price(market.binance_symbol)
-        if (opening > 0 or current > 0) and latest_binance > 0:
-            market.official_binance_ref_price = latest_binance
-            market.official_binance_ref_ts = time.time()
 
     async def _backfill_opening_price(self, market: CryptoMarket):
         if market.has_opening_price:
@@ -452,11 +480,7 @@ class MarketRegistry:
         stale = [
             m for m in self._markets.values()
             if m.secs_remaining > 10
-            and (
-                m.official_price_age >= self._official_refresh_interval
-                or not m.has_official_opening_price
-                or not m.has_official_current_price
-            )
+            and not m.has_official_opening_price
         ]
         if stale:
             await asyncio.gather(

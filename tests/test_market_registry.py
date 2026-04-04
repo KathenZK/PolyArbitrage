@@ -98,6 +98,20 @@ class MarketRegistryTests(unittest.TestCase):
         self.assertAlmostEqual(market.official_binance_ref_price, 101.25, places=6)
         self.assertGreater(market.official_binance_ref_ts, 0.0)
 
+    def test_apply_chainlink_price_sets_official_current_and_reference(self):
+        gamma = DummyGamma()
+        registry = MarketRegistry(gamma, assets=["btc"])
+        market = build_market(event_start=time.time() - 30)
+        market.official_opening_price = 100.0
+        registry._markets["btcusdt"] = market
+        registry.buffer_tick("btcusdt", 101.75, market.event_start + 31)
+
+        registry.apply_chainlink_price("btc/usd", 101.6, market.event_start + 32)
+
+        self.assertAlmostEqual(market.official_current_price, 101.6, places=6)
+        self.assertAlmostEqual(market.official_binance_ref_price, 101.75, places=6)
+        self.assertAlmostEqual(market.official_binance_ref_ts, market.event_start + 32, places=6)
+
     def test_backfill_opening_price_from_binance_aggtrades(self):
         event_start = time.time() - 5
         trades = [

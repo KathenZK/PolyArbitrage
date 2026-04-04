@@ -513,18 +513,35 @@ def build_funding_panel(pipeline: Pipeline) -> Panel:
     net_invested = ex.net_cash_invested
 
     marked_value = 0.0
+    markable_cost = 0.0
+    markable_value = 0.0
+    carried_cost = 0.0
+    markable_positions = 0
+    carried_positions = 0
     for pos in positions:
         market = pipeline.registry.get_market(pos.binance_symbol)
         if market is None or (pos.market_slug and market.slug != pos.market_slug):
+            carried_cost += pos.available_shares * pos.avg_entry_price
             marked_value += pos.available_shares * pos.avg_entry_price
+            carried_positions += 1
             continue
         token_price = market.up_price if pos.direction == "UP" else market.down_price
         if token_price <= 0:
             token_price = pos.avg_entry_price
-        marked_value += pos.available_shares * token_price
+            carried_cost += pos.available_shares * pos.avg_entry_price
+            marked_value += pos.available_shares * pos.avg_entry_price
+            carried_positions += 1
+            continue
+        cost_basis = pos.available_shares * pos.avg_entry_price
+        current_value = pos.available_shares * token_price
+        markable_cost += cost_basis
+        markable_value += current_value
+        marked_value += current_value
+        markable_positions += 1
 
     unrealized = marked_value - unsettled_cost
     open_markets = len({pos.market_slug for pos in positions if pos.market_slug})
+    active_unrealized = markable_value - markable_cost
 
     t = Text()
     t.append(" 已买入成交: ")
@@ -548,11 +565,37 @@ def build_funding_panel(pipeline: Pipeline) -> Panel:
     t.append(" ─── 未结算头寸 ───\n", style="dim")
     t.append(f" 头寸数: {len(positions)}")
     t.append(f"  待结算市场: {open_markets}\n")
-    t.append(" 浮动盈亏: ")
-    t.append(
-        f"${unrealized:+,.2f}",
-        style="green" if unrealized >= 0 else "red",
-    )
+    t.append(" 可市价估值: ")
+    t.append(f"{markable_positions}", style="cyan" if markable_positions > 0 else "dim")
+    t.append("  按成本记账: ")
+    t.append(f"{carried_positions}\n", style="yellow" if carried_positions > 0 else "dim")
+
+    if markable_positions > 0:
+        t.append(" 当前浮盈亏: ")
+        t.append(
+            f"${active_unrealized:+,.2f}",
+            style="green" if active_unrealized >= 0 else "red",
+        )
+        if carried_positions > 0:
+            t.append("  历史待结算: ")
+            t.append(f"${carried_cost:,.2f}", style="yellow")
+    else:
+        t.append(" 当前浮盈亏: ")
+        t.append("--", style="dim")
+        if carried_positions > 0:
+            t.append("  历史待结算: ")
+            t.append(f"${carried_cost:,.2f}", style="yellow")
+    t.append("\n")
+
+    if carried_positions > 0:
+        t.append(" 注: 非当前活跃窗口的仓位先按成本记账", style="dim")
+    elif positions:
+        t.append(
+            f" 总浮盈亏: ${unrealized:+,.2f}",
+            style="green" if unrealized >= 0 else "red",
+        )
+    else:
+        t.append(" 当前无未结算仓位", style="dim")
 
     return Panel(t, title="资金", border_style="yellow")
 

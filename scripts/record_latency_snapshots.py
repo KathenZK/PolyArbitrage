@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.data.binance_stream import BinanceStream, Tick
 from src.data.market_registry import MarketRegistry
 from src.data.polymarket_client import PolymarketCLOBClient, PolymarketGammaClient, TokenBookSnapshot
+from src.data.polymarket_rtds import PolymarketRTDSStream, RTDSPriceUpdate
 
 logger = logging.getLogger("snapshot_recorder")
 
@@ -52,6 +53,10 @@ class SnapshotRecorder:
             symbols=strat.get("symbols", ["btcusdt", "ethusdt", "solusdt"]),
             on_tick=self.on_tick,
         )
+        self.rtds = PolymarketRTDSStream(
+            chainlink_symbols=self.registry.chainlink_symbols,
+            on_chainlink_price=self.on_chainlink_price,
+        )
 
         self._snapshot_fp = None
         self._settlement_fp = None
@@ -70,6 +75,7 @@ class SnapshotRecorder:
         await self.registry.refresh()
         registry_task = asyncio.create_task(self.registry.run())
         stream_task = asyncio.create_task(self.stream.run())
+        rtds_task = asyncio.create_task(self.rtds.run())
         self._running = True
 
         logger.info(f"Recording snapshots -> {self.snapshot_path}")
@@ -83,9 +89,11 @@ class SnapshotRecorder:
                     await asyncio.sleep(1.0)
         finally:
             self.stream.stop()
+            self.rtds.stop()
             self.registry.stop()
             registry_task.cancel()
             stream_task.cancel()
+            rtds_task.cancel()
             self._flush_open_windows()
             await self.gamma.close()
             if self._snapshot_fp is not None:
@@ -95,6 +103,9 @@ class SnapshotRecorder:
 
     def stop(self):
         self._running = False
+
+    async def on_chainlink_price(self, update: RTDSPriceUpdate):
+        self.registry.apply_chainlink_price(update.symbol, update.value, update.timestamp)
 
     async def on_tick(self, tick: Tick):
         recorded_at = time.time()
