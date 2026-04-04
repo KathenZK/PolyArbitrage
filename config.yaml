@@ -69,7 +69,7 @@ strategy:
   official_refresh_sec: 5
 
 risk:
-  dry_run: true
+  dry_run: false
   require_live_arm: true
   clob_heartbeat_interval_sec: 5
   max_live_orders_per_day: 4
