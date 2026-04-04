@@ -598,27 +598,27 @@ def build_funding_panel(pipeline: Pipeline) -> Panel:
         t.append(" 当前无未结算仓位", style="dim")
 
     if pipeline.settlement:
-        stats = pipeline.settlement.stats
-        total = stats.get("total", 0)
-        if total > 0:
-            wins = stats.get("wins", 0)
-            losses = stats.get("losses", 0)
-            cum_pnl = stats.get("total_pnl", 0.0)
-            actual_rate = stats.get("actual_win_rate", 0.0)
-            model_rate = stats.get("avg_model_win_prob", 0.0)
-            t.append("\n ─── 已结算统计 ───\n", style="dim")
-            t.append(f" 结算: {total}笔  ")
-            t.append(f"{wins}赢", style="green")
-            t.append(f" {losses}亏", style="red")
-            t.append(f"  实际胜率: ")
-            rate_style = "green" if actual_rate >= model_rate else "red"
-            t.append(f"{actual_rate:.1%}", style=rate_style)
-            t.append(f" (模型{model_rate:.1%})\n")
-            t.append(" 累计盈亏: ")
+        s = pipeline.settlement
+        session_total = s.settled_count
+        if session_total > 0:
+            session_rate = s.win_count / session_total if session_total > 0 else 0
+            t.append("\n ─── 本轮结算 ───\n", style="dim")
+            t.append(f" 结算: {session_total}笔  ")
+            t.append(f"{s.win_count}赢", style="green")
+            t.append(f" {s.loss_count}亏", style="red")
+            t.append(f"  胜率: ")
+            t.append(f"{session_rate:.1%}", style="green" if session_rate >= 0.6 else "red")
+            t.append(f"\n 盈亏: ")
             t.append(
-                f"${cum_pnl:+,.2f}",
-                style="green" if cum_pnl >= 0 else "red",
+                f"${s.total_pnl:+,.2f}",
+                style="green" if s.total_pnl >= 0 else "red",
             )
+        db_stats = s.stats
+        db_total = db_stats.get("total", 0)
+        if db_total > session_total:
+            hist_total = db_total - session_total
+            hist_pnl = db_stats.get("total_pnl", 0.0) - s.total_pnl
+            t.append(f"  (历史{hist_total}笔 ${hist_pnl:+,.2f})", style="dim")
 
     return Panel(t, title="资金", border_style="yellow")
 
