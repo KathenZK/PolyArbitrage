@@ -91,4 +91,4 @@ redeem:
 alerts:
   dingtalk_webhook: ""             # set via DINGTALK_WEBHOOK env var
   dingtalk_keyword: "PolyGod"
-  heartbeat_interval_sec: 3600     # 0 to disable; default 1 hour
+  heartbeat_interval_sec: 0        # disable hourly DingTalk heartbeat; keep startup/trade alerts only
