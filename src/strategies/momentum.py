@@ -51,24 +51,38 @@ def estimate_win_prob(
     deviation_abs: float,
     remaining_secs: float,
     annual_vol: float,
+    *,
+    fat_tail_dampening: float = 1.0,
+    max_win_prob: float = 1.0,
 ) -> float:
     """P(price stays on the same side of opening at settlement).
 
     Under zero-drift GBM, if current price is d% above opening with τ seconds
     remaining and annualized vol σ, the probability of finishing above opening is
     Φ(d / (σ × √τ_in_years)).
+
+    fat_tail_dampening < 1.0 shrinks the estimate toward 0.5 to account for
+    excess kurtosis in crypto returns (fat tails cause more reversals than
+    the normal distribution predicts).
+
+    max_win_prob caps the output to prevent overconfident estimates.
     """
     if remaining_secs <= 0:
-        return 1.0 if deviation_abs > 0 else 0.5
+        return min(max_win_prob, 1.0) if deviation_abs > 0 else 0.5
 
     tau = remaining_secs / SECS_PER_YEAR
     sigma_remaining = annual_vol * sqrt(tau)
 
     if sigma_remaining <= 1e-12:
-        return 1.0 if deviation_abs > 0 else 0.5
+        return min(max_win_prob, 1.0) if deviation_abs > 0 else 0.5
 
     z = deviation_abs / sigma_remaining
-    return normal_cdf(z)
+    p = normal_cdf(z)
+
+    if fat_tail_dampening < 1.0:
+        p = 0.5 + (p - 0.5) * fat_tail_dampening
+
+    return min(p, max_win_prob)
 
 
 class Direction(str, Enum):
@@ -241,11 +255,20 @@ def calibrated_same_side_prob(
     annual_vol: float,
     source_gap: float,
     source_gap_penalty_mult: float,
+    fat_tail_dampening: float = 1.0,
+    max_win_prob: float = 1.0,
     calibrator: ProbabilityCalibrator | None = None,
 ) -> tuple[float, str, int]:
-    win_prob = estimate_win_prob(deviation_abs, secs_remaining, annual_vol)
+    win_prob = estimate_win_prob(
+        deviation_abs,
+        secs_remaining,
+        annual_vol,
+        fat_tail_dampening=fat_tail_dampening,
+        max_win_prob=max_win_prob,
+    )
     if source_gap > 0:
         win_prob = max(0.50, win_prob - min(0.20, source_gap * source_gap_penalty_mult))
+    win_prob = min(win_prob, max_win_prob)
     if calibrator is None:
         return win_prob, "brownian", 0
     return calibrator.calibrate(
@@ -275,6 +298,8 @@ class PriceComparator:
         prob_calibration_path: str | None = None,
         prob_calibration_min_samples: int = 50,
         prob_calibration_prior_strength: float = 20.0,
+        fat_tail_dampening: float = 0.80,
+        max_win_prob: float = 0.92,
     ):
         self._registry = registry
         self._threshold = threshold_pct
@@ -286,6 +311,8 @@ class PriceComparator:
         self._max_source_divergence = max_source_divergence_pct
         self._source_gap_penalty_mult = source_gap_penalty_mult
         self._use_realized_vol = use_realized_vol
+        self._fat_tail_dampening = fat_tail_dampening
+        self._max_win_prob = max_win_prob
         self._calibrator = ProbabilityCalibrator(
             prob_calibration_path,
             min_samples=prob_calibration_min_samples,
@@ -409,6 +436,8 @@ class PriceComparator:
             annual_vol=annual_vol,
             source_gap=source_gap if using_official else 0.0,
             source_gap_penalty_mult=self._source_gap_penalty_mult,
+            fat_tail_dampening=self._fat_tail_dampening,
+            max_win_prob=self._max_win_prob,
             calibrator=self._calibrator,
         )
         if effective_deviation > 0:

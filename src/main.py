@@ -39,6 +39,7 @@ from src.output.db import get_connection, init_db
 from src.output.dashboard import build_dashboard
 from src.strategies.executor import Executor
 from src.strategies.momentum import PriceComparator, Signal
+from src.strategies.settlement import SettlementTracker
 from src.strategies.signal_guard import SignalGuard
 
 console = Console()
@@ -90,6 +91,8 @@ class Pipeline:
             prob_calibration_path=strat.get("prob_calibration_path"),
             prob_calibration_min_samples=strat.get("prob_calibration_min_samples", 50),
             prob_calibration_prior_strength=strat.get("prob_calibration_prior_strength", 20.0),
+            fat_tail_dampening=strat.get("fat_tail_dampening", 0.80),
+            max_win_prob=strat.get("max_win_prob", 0.92),
         )
         self.guard = SignalGuard(
             cooldown_secs=strat.get("signal_cooldown_sec", 120),
@@ -124,6 +127,7 @@ class Pipeline:
             max_consecutive_expired=risk.get("max_consecutive_expired", 0),
             circuit_breaker_cooldown_sec=risk.get("circuit_breaker_cooldown_sec", 900),
             max_directional_exposure_usd=risk.get("max_directional_exposure_usd", 0.0),
+            max_total_directional_exposure_usd=risk.get("max_total_directional_exposure_usd", 0.0),
             exit_enabled=strat.get("exit_enabled", True),
             exit_poll_interval_secs=strat.get("exit_poll_interval_sec", 5.0),
             exit_min_hold_secs=strat.get("exit_min_hold_secs", 15.0),
@@ -154,6 +158,10 @@ class Pipeline:
             chainlink_symbols=self.registry.chainlink_symbols,
             on_chainlink_price=self._on_chainlink_price,
         )
+
+        settle_cfg = config.get("settlement", {})
+        self.settlement: SettlementTracker | None = None
+        self._settlement_poll_interval = settle_cfg.get("poll_interval_sec", 60)
 
         self.signals: list[Signal] = []
         self.ticks_count = 0
@@ -422,6 +430,10 @@ class Pipeline:
         init_db(self._db_conn)
         self.executor.attach_db(self._db_conn)
         self.redeemer.attach_db(self._db_conn)
+        self.settlement = SettlementTracker(
+            self.gamma, self._db_conn,
+            poll_interval_secs=self._settlement_poll_interval,
+        )
 
         registry_task = asyncio.create_task(self.registry.run())
         await self.registry.refresh()
@@ -436,6 +448,7 @@ class Pipeline:
         rtds_task = asyncio.create_task(self.rtds.run())
         reconcile_task = asyncio.create_task(self._reconcile_loop())
         exit_task = asyncio.create_task(self._exit_loop())
+        settlement_task = asyncio.create_task(self.settlement.run())
         redeem_task = asyncio.create_task(self._redeem_loop()) if not dry_run else None
         clob_heartbeat_task = asyncio.create_task(self._clob_heartbeat_loop()) if not dry_run else None
         heartbeat_task = asyncio.create_task(self._heartbeat_loop())
@@ -458,6 +471,7 @@ class Pipeline:
             rtds_task.cancel()
             reconcile_task.cancel()
             exit_task.cancel()
+            settlement_task.cancel()
             if redeem_task is not None:
                 redeem_task.cancel()
             if clob_heartbeat_task is not None:
@@ -479,6 +493,10 @@ class Pipeline:
         init_db(self._db_conn)
         self.executor.attach_db(self._db_conn)
         self.redeemer.attach_db(self._db_conn)
+        self.settlement = SettlementTracker(
+            self.gamma, self._db_conn,
+            poll_interval_secs=self._settlement_poll_interval,
+        )
 
         registry_task = asyncio.create_task(self.registry.run())
         await self.registry.refresh()
@@ -491,6 +509,7 @@ class Pipeline:
         rtds_task = asyncio.create_task(self.rtds.run())
         reconcile_task = asyncio.create_task(self._reconcile_loop())
         exit_task = asyncio.create_task(self._exit_loop())
+        settlement_task = asyncio.create_task(self.settlement.run())
         redeem_task = asyncio.create_task(self._redeem_loop()) if not dry_run else None
         clob_heartbeat_task = asyncio.create_task(self._clob_heartbeat_loop()) if not dry_run else None
         heartbeat_task = asyncio.create_task(self._heartbeat_loop())
@@ -507,6 +526,7 @@ class Pipeline:
             rtds_task.cancel()
             reconcile_task.cancel()
             exit_task.cancel()
+            settlement_task.cancel()
             if redeem_task is not None:
                 redeem_task.cancel()
             if clob_heartbeat_task is not None:
@@ -520,6 +540,8 @@ class Pipeline:
         self.stream.stop()
         self.rtds.stop()
         self.registry.stop()
+        if self.settlement:
+            self.settlement.stop()
         await self.alerts.close()
         await self.gamma.close()
         if self._db_conn is not None:

@@ -2,7 +2,7 @@ strategy:
   symbols: ["btcusdt", "ethusdt", "solusdt"]
 
   # Signal: trade the official Polymarket event, not raw Binance spot
-  edge_threshold_pct: 0.003        # 0.3% minimum deviation to generate a signal
+  edge_threshold_pct: 0.005        # 0.5% minimum deviation — raised from 0.3% to filter noise
   min_secs_remaining: 30           # skip markets with < 30s left
   min_secs_elapsed: 30             # wait 30s after window opens before trading
   require_official_source: true    # require official Polymarket/Chainlink anchor before trading
@@ -23,14 +23,18 @@ strategy:
   # Signal guard: one trade per market window
   signal_cooldown_sec: 120
 
+  # Fat-tail correction: crypto returns have excess kurtosis (more reversals than Brownian predicts)
+  fat_tail_dampening: 0.80         # shrink Brownian win_prob toward 0.5 (1.0 = no dampening)
+  max_win_prob: 0.92               # never claim >92% certainty regardless of model output
+
   # Execution: submit only if fill-adjusted EV = fill_prob × B × (p_adj / q - 1) >= min_ev_usd
   bet_size_usd: 5                  # must satisfy order_min_size × q; auto-scales via max_bet_multiplier
   max_bet_multiplier: 2.5          # allow effective bet up to 2.5× base when min_order_size requires it
   min_liquidity: 1000
   min_ev_usd: 0.10                 # minimum real EV in USD to place a trade
-  adverse_selection_haircut: 0.05  # base haircut; increases toward settlement per time_ramp
+  adverse_selection_haircut: 0.08  # base haircut — raised from 0.05 to be more conservative
   adverse_selection_time_ramp_sec: 300  # haircut doubles linearly in last N seconds before settlement
-  fill_adverse_coeff: 0.03         # EV discount for fill-win probability correlation
+  fill_adverse_coeff: 0.05         # EV discount for fill-win probability correlation — raised from 0.03
   maker_offset_ticks: 1
   fill_rate_prior: 0.35            # prior maker fill ratio before enough live samples exist
   fill_min_samples: 20             # minimum resolved live orders before using empirical fill stats
@@ -72,7 +76,11 @@ risk:
   max_live_notional_usd_per_day: 20       # raised for bet_size=5
   max_consecutive_expired: 8              # circuit breaker: pause after N consecutive expired/unfilled orders
   circuit_breaker_cooldown_sec: 900       # 15-min cooldown after circuit breaker triggers
-  max_directional_exposure_usd: 15        # max pending+filled exposure per direction (UP/DOWN)
+  max_directional_exposure_usd: 15        # max pending+filled exposure per direction (UP/DOWN) per asset
+  max_total_directional_exposure_usd: 25  # total cross-asset cap per direction (BTC+ETH+SOL combined)
+
+settlement:
+  poll_interval_sec: 60             # check for resolved markets every 60s
 
 redeem:
   enabled: true

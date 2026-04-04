@@ -4,7 +4,7 @@ import time
 import unittest
 
 from src.data.market_registry import CryptoMarket
-from src.strategies.momentum import PriceComparator
+from src.strategies.momentum import PriceComparator, estimate_win_prob
 
 
 class _StubRegistry:
@@ -66,6 +66,41 @@ class MomentumTests(unittest.TestCase):
         self.assertEqual(estimate.price_source, "official_anchor_fast_return")
         self.assertGreater(estimate.up_win_prob, 0.5)
         self.assertAlmostEqual(estimate.effective_deviation_pct, 0.005, places=6)
+
+
+    def test_fat_tail_dampening_reduces_extreme_probabilities(self):
+        p_undamped = estimate_win_prob(0.005, 300, 0.60)
+        p_damped = estimate_win_prob(0.005, 300, 0.60, fat_tail_dampening=0.80)
+        self.assertGreater(p_undamped, p_damped)
+        self.assertGreater(p_damped, 0.5)
+        expected = 0.5 + (p_undamped - 0.5) * 0.80
+        self.assertAlmostEqual(p_damped, expected, places=6)
+
+    def test_max_win_prob_caps_output(self):
+        p = estimate_win_prob(0.02, 30, 0.60, max_win_prob=0.92)
+        self.assertLessEqual(p, 0.92)
+
+    def test_fat_tail_dampening_preserves_fifty_fifty(self):
+        p = estimate_win_prob(0.0, 300, 0.60, fat_tail_dampening=0.80)
+        self.assertAlmostEqual(p, 0.5, places=6)
+
+    def test_comparator_passes_dampening_to_model(self):
+        market = _build_market()
+        registry = _StubRegistry(market)
+        comp_full = PriceComparator(
+            registry=registry, threshold_pct=0.001,
+            fat_tail_dampening=1.0, max_win_prob=1.0,
+        )
+        comp_damped = PriceComparator(
+            registry=registry, threshold_pct=0.001,
+            fat_tail_dampening=0.80, max_win_prob=0.92,
+        )
+        est_full = comp_full.estimate("btcusdt", 100500.0, time.time())
+        est_damped = comp_damped.estimate("btcusdt", 100500.0, time.time())
+        self.assertIsNotNone(est_full)
+        self.assertIsNotNone(est_damped)
+        assert est_full is not None and est_damped is not None
+        self.assertGreater(est_full.up_win_prob, est_damped.up_win_prob)
 
 
 if __name__ == "__main__":

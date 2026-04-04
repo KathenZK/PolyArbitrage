@@ -597,6 +597,29 @@ def build_funding_panel(pipeline: Pipeline) -> Panel:
     else:
         t.append(" 当前无未结算仓位", style="dim")
 
+    if pipeline.settlement:
+        stats = pipeline.settlement.stats
+        total = stats.get("total", 0)
+        if total > 0:
+            wins = stats.get("wins", 0)
+            losses = stats.get("losses", 0)
+            cum_pnl = stats.get("total_pnl", 0.0)
+            actual_rate = stats.get("actual_win_rate", 0.0)
+            model_rate = stats.get("avg_model_win_prob", 0.0)
+            t.append("\n ─── 已结算统计 ───\n", style="dim")
+            t.append(f" 结算: {total}笔  ")
+            t.append(f"{wins}赢", style="green")
+            t.append(f" {losses}亏", style="red")
+            t.append(f"  实际胜率: ")
+            rate_style = "green" if actual_rate >= model_rate else "red"
+            t.append(f"{actual_rate:.1%}", style=rate_style)
+            t.append(f" (模型{model_rate:.1%})\n")
+            t.append(" 累计盈亏: ")
+            t.append(
+                f"${cum_pnl:+,.2f}",
+                style="green" if cum_pnl >= 0 else "red",
+            )
+
     return Panel(t, title="资金", border_style="yellow")
 
 

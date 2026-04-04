@@ -37,6 +37,9 @@ TRADE_COLUMNS: dict[str, str] = {
     "tick_size_at_submit": "REAL NOT NULL DEFAULT 0.01",
     "last_error": "TEXT DEFAULT ''",
     "raw_json": "TEXT DEFAULT '{}'",
+    "settled_side": "TEXT DEFAULT ''",
+    "settled_at": "REAL",
+    "settlement_source": "TEXT DEFAULT ''",
 }
 
 REDEEM_COLUMNS: dict[str, str] = {
@@ -525,6 +528,79 @@ def get_fill_calibration_rows(
         (since_ts,),
     ).fetchall()
     return [dict(row) for row in rows]
+
+
+def get_unsettled_trades(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """Filled BUY trades where market window has ended but settlement not recorded."""
+    now = time.time()
+    rows = conn.execute(
+        """
+        SELECT *
+        FROM trades
+        WHERE COALESCE(order_side, 'BUY') = 'BUY'
+          AND matched_size > 0
+          AND COALESCE(settled_side, '') = ''
+          AND market_slug <> ''
+          AND expiration_ts > 0
+          AND expiration_ts < ?
+        ORDER BY timestamp ASC
+        """,
+        (now,),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def settle_trade(
+    conn: sqlite3.Connection,
+    trade_id: int,
+    *,
+    settled_side: str,
+    pnl: float,
+    settlement_source: str = "",
+):
+    now = time.time()
+    conn.execute(
+        """
+        UPDATE trades
+        SET settled_side=?, pnl=?, settled_at=?, settlement_source=?, updated_at=?
+        WHERE id=?
+        """,
+        (settled_side, pnl, now, settlement_source, now, trade_id),
+    )
+    conn.commit()
+
+
+def get_settlement_stats(conn: sqlite3.Connection) -> dict[str, Any]:
+    row = conn.execute(
+        """
+        SELECT
+            COUNT(*) AS total,
+            SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) AS wins,
+            SUM(CASE WHEN pnl < 0 THEN 1 ELSE 0 END) AS losses,
+            SUM(CASE WHEN pnl = 0 AND settled_side <> '' THEN 1 ELSE 0 END) AS breakeven,
+            COALESCE(SUM(pnl), 0) AS total_pnl,
+            COALESCE(SUM(matched_cost_usd), 0) AS total_cost,
+            COALESCE(AVG(win_prob), 0) AS avg_model_win_prob
+        FROM trades
+        WHERE settled_side <> ''
+          AND COALESCE(order_side, 'BUY') = 'BUY'
+          AND matched_size > 0
+        """
+    ).fetchone()
+    if not row:
+        return {"total": 0, "wins": 0, "losses": 0, "total_pnl": 0.0}
+    total = int(row["total"] or 0)
+    wins = int(row["wins"] or 0)
+    return {
+        "total": total,
+        "wins": wins,
+        "losses": int(row["losses"] or 0),
+        "breakeven": int(row["breakeven"] or 0),
+        "total_pnl": float(row["total_pnl"] or 0),
+        "total_cost": float(row["total_cost"] or 0),
+        "actual_win_rate": wins / total if total > 0 else 0.0,
+        "avg_model_win_prob": float(row["avg_model_win_prob"] or 0),
+    }
 
 
 def get_live_daily_usage(conn: sqlite3.Connection, *, now_ts: float | None = None) -> dict[str, float]:

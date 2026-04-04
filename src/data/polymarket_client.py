@@ -530,17 +530,26 @@ class PolymarketCLOBClient:
             levels = getattr(book, side, [])
         return list(levels or [])
 
+    def _sorted_book_levels(self, book: Any, side: str) -> list[Any]:
+        levels = self._read_book_levels(book, side)
+        reverse = side == "bids"
+        return sorted(
+            levels,
+            key=lambda level: self._read_level_value(level, "price"),
+            reverse=reverse,
+        )
+
     def get_best_bid(self, token_id: str) -> float:
         """Return the highest resting bid for post-only BUY pricing."""
         book = self.get_orderbook(token_id)
-        bids = self._read_book_levels(book, "bids")
+        bids = self._sorted_book_levels(book, "bids")
         if bids:
             return self._read_level_value(bids[0], "price")
         return 0.0
 
     def get_best_ask(self, token_id: str) -> float:
         book = self.get_orderbook(token_id)
-        asks = self._read_book_levels(book, "asks")
+        asks = self._sorted_book_levels(book, "asks")
         if asks:
             return self._read_level_value(asks[0], "price")
         return 0.0
@@ -550,11 +559,11 @@ class PolymarketCLOBClient:
         book = self.get_orderbook(token_id)
         bid_depth = sum(
             self._read_level_value(level, "price") * self._read_level_value(level, "size")
-            for level in self._read_book_levels(book, "bids")[:levels]
+            for level in self._sorted_book_levels(book, "bids")[:levels]
         )
         ask_depth = sum(
             self._read_level_value(level, "price") * self._read_level_value(level, "size")
-            for level in self._read_book_levels(book, "asks")[:levels]
+            for level in self._sorted_book_levels(book, "asks")[:levels]
         )
         return bid_depth, ask_depth
 
@@ -567,8 +576,8 @@ class PolymarketCLOBClient:
 
     def get_book_snapshot(self, token_id: str) -> TokenBookSnapshot:
         book = self.get_orderbook(token_id)
-        bids = self._read_book_levels(book, "bids")
-        asks = self._read_book_levels(book, "asks")
+        bids = self._sorted_book_levels(book, "bids")
+        asks = self._sorted_book_levels(book, "asks")
         best_bid = self._read_level_value(bids[0], "price") if bids else 0.0
         best_ask = self._read_level_value(asks[0], "price") if asks else 0.0
         best_bid_size = self._read_level_value(bids[0], "size") if bids else 0.0

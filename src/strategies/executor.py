@@ -246,6 +246,7 @@ class Executor:
         exit_resolution_buffer: float = 0.015,
         exit_capital_lock_penalty: float = 0.01,
         exit_min_improvement_abs: float = 0.005,
+        max_total_directional_exposure_usd: float = 0.0,
     ):
         self._bet_size = bet_size_usd
         self._dry_run = dry_run
@@ -276,6 +277,7 @@ class Executor:
         self._max_consecutive_expired = max_consecutive_expired
         self._circuit_breaker_cooldown = circuit_breaker_cooldown_sec
         self._max_directional_exposure = max_directional_exposure_usd
+        self._max_total_directional_exposure = max_total_directional_exposure_usd
         self._exit_enabled = exit_enabled
         self._exit_poll_interval = exit_poll_interval_secs
         self._exit_min_hold_secs = exit_min_hold_secs
@@ -1430,6 +1432,19 @@ class Executor:
                     f"Skip {signal.asset} {signal.direction.value}: "
                     f"directional exposure ${exposure.get(signal.direction.value, 0.0):.2f} "
                     f"+ ${effective_bet:.2f} > cap ${self._max_directional_exposure:.2f}"
+                )
+                return None
+
+        if self._max_total_directional_exposure > 0:
+            exposure = self._active_directional_exposure()
+            total_same_dir = exposure.get(signal.direction.value, 0.0)
+            if total_same_dir + effective_bet > self._max_total_directional_exposure:
+                if count_skips:
+                    self._skipped_live_limits += 1
+                logger.debug(
+                    f"Skip {signal.asset} {signal.direction.value}: "
+                    f"total cross-asset exposure ${total_same_dir:.2f} "
+                    f"+ ${effective_bet:.2f} > cap ${self._max_total_directional_exposure:.2f}"
                 )
                 return None
 

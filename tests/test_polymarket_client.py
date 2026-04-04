@@ -122,8 +122,8 @@ class PolymarketClientTests(unittest.TestCase):
     def test_orderbook_helpers_support_sdk_objects(self):
         client = PolymarketCLOBClient("test-key")
         client.get_orderbook = lambda token_id: BookObj(
-            bids=[LevelObj("0.61", "10"), LevelObj("0.60", "8")],
-            asks=[LevelObj("0.63", "12"), LevelObj("0.64", "4")],
+            bids=[LevelObj("0.60", "8"), LevelObj("0.61", "10")],
+            asks=[LevelObj("0.64", "4"), LevelObj("0.63", "12")],
         )
 
         self.assertEqual(client.get_best_bid("token"), 0.61)
