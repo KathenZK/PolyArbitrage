@@ -779,22 +779,41 @@ class Executor:
         ramp = max(0.0, 1.0 - secs_remaining / self._haircut_ramp_sec)
         return self._haircut * (1.0 + ramp)
 
-    def _active_directional_exposure(self) -> dict[str, float]:
-        """Total outstanding exposure per direction across recent orders."""
-        exposure: dict[str, float] = {"UP": 0.0, "DOWN": 0.0}
-        cutoff = time.time() - 900
+    def _active_directional_exposure(self) -> tuple[dict[tuple[str, str], float], dict[str, float]]:
+        """Outstanding exposure by (asset, direction) and direction total.
+
+        Uses actual open positions plus pending BUY commitments instead of a
+        recent-order window, so long-lived hold->redeem positions remain
+        counted in risk limits.
+        """
+        per_asset: dict[tuple[str, str], float] = {}
+        total: dict[str, float] = {"UP": 0.0, "DOWN": 0.0}
+
+        for position in self.open_positions():
+            direction = position.direction.upper()
+            if direction not in total:
+                continue
+            exposure_usd = max(0.0, position.available_shares * position.avg_entry_price)
+            if exposure_usd <= 1e-9:
+                continue
+            key = (position.asset.upper(), direction)
+            per_asset[key] = per_asset.get(key, 0.0) + exposure_usd
+            total[direction] += exposure_usd
+
         for trade in self._orders:
-            if trade.timestamp < cutoff:
+            if trade.status != OrderStatus.PENDING or trade.order_side != "BUY":
                 continue
             direction = trade.direction.upper()
-            if direction not in exposure:
+            if direction not in total:
                 continue
-            sign = 1.0 if trade.order_side == "BUY" else -1.0
-            if trade.status == OrderStatus.PENDING:
-                exposure[direction] += sign * trade.cost_usd
-            elif trade.status == OrderStatus.FILLED:
-                exposure[direction] += sign * trade.matched_cost_usd
-        return exposure
+            remaining_commitment = max(0.0, trade.cost_usd - trade.matched_cost_usd)
+            if remaining_commitment <= 1e-9:
+                continue
+            key = (trade.asset.upper(), direction)
+            per_asset[key] = per_asset.get(key, 0.0) + remaining_commitment
+            total[direction] += remaining_commitment
+
+        return per_asset, total
 
     def _fallback_token_quote(self, token_id: str, token_price: float, *, tick_size: float = 0.01) -> TokenQuote:
         tick_size = max(tick_size, 0.001)
@@ -1424,20 +1443,21 @@ class Executor:
                 return None
 
         if self._max_directional_exposure > 0:
-            exposure = self._active_directional_exposure()
-            if exposure.get(signal.direction.value, 0.0) + effective_bet > self._max_directional_exposure:
+            per_asset_exposure, _ = self._active_directional_exposure()
+            current_asset_dir = per_asset_exposure.get((signal.asset.upper(), signal.direction.value), 0.0)
+            if current_asset_dir + effective_bet > self._max_directional_exposure:
                 if count_skips:
                     self._skipped_live_limits += 1
                 logger.debug(
                     f"Skip {signal.asset} {signal.direction.value}: "
-                    f"directional exposure ${exposure.get(signal.direction.value, 0.0):.2f} "
+                    f"directional exposure ${current_asset_dir:.2f} "
                     f"+ ${effective_bet:.2f} > cap ${self._max_directional_exposure:.2f}"
                 )
                 return None
 
         if self._max_total_directional_exposure > 0:
-            exposure = self._active_directional_exposure()
-            total_same_dir = exposure.get(signal.direction.value, 0.0)
+            _, total_exposure = self._active_directional_exposure()
+            total_same_dir = total_exposure.get(signal.direction.value, 0.0)
             if total_same_dir + effective_bet > self._max_total_directional_exposure:
                 if count_skips:
                     self._skipped_live_limits += 1

@@ -25,7 +25,7 @@ from src.output.db import get_settlement_stats, get_unsettled_trades, settle_tra
 logger = logging.getLogger(__name__)
 
 SETTLE_DELAY_SECS = 90
-MAX_SETTLE_ATTEMPTS = 10
+MAX_SETTLE_BACKOFF_SECS = 3600
 
 
 class SettlementTracker:
@@ -41,6 +41,7 @@ class SettlementTracker:
         self._poll_interval = poll_interval_secs
         self._running = False
         self._attempt_counts: dict[str, int] = {}
+        self._next_retry_at: dict[str, float] = {}
         self.settled_count = 0
         self.win_count = 0
         self.loss_count = 0
@@ -73,8 +74,7 @@ class SettlementTracker:
             window_end = expiration - 60
             if now < window_end + SETTLE_DELAY_SECS:
                 continue
-            attempts = self._attempt_counts.get(slug, 0)
-            if attempts >= MAX_SETTLE_ATTEMPTS:
+            if now < self._next_retry_at.get(slug, 0.0):
                 continue
             by_slug.setdefault(slug, []).append(trade)
 
@@ -86,25 +86,29 @@ class SettlementTracker:
                     timeout=15,
                 )
             except Exception as exc:
-                self._attempt_counts[slug] = self._attempt_counts.get(slug, 0) + 1
+                self._schedule_retry(slug)
                 logger.debug(f"Settlement truth fetch failed for {slug}: {exc}")
                 continue
 
             if not truth.get("resolved_truth_available"):
-                self._attempt_counts[slug] = self._attempt_counts.get(slug, 0) + 1
+                self._schedule_retry(slug)
                 continue
 
             winning_side = str(truth.get("resolved_settle_side", "") or "").upper()
             source = str(truth.get("resolved_truth_source", "") or "")
             if winning_side not in {"UP", "DOWN"}:
-                self._attempt_counts[slug] = self._attempt_counts.get(slug, 0) + 1
+                self._schedule_retry(slug)
                 continue
 
             for trade in slug_trades:
                 trade_id = int(trade["id"])
                 direction = str(trade.get("action", "") or "").upper()
-                matched_shares = float(trade.get("matched_size", 0) or 0)
-                matched_cost = float(trade.get("matched_cost_usd", 0) or 0)
+                matched_shares = float(
+                    trade.get("remaining_size", trade.get("matched_size", 0)) or 0
+                )
+                matched_cost = float(
+                    trade.get("remaining_cost_usd", trade.get("matched_cost_usd", 0)) or 0
+                )
                 entry_price = float(trade.get("price", 0) or 0)
 
                 if direction == winning_side:
@@ -117,6 +121,8 @@ class SettlementTracker:
                     trade_id,
                     settled_side=winning_side,
                     pnl=pnl,
+                    settled_size=matched_shares,
+                    settled_cost_usd=matched_cost,
                     settlement_source=source,
                 )
                 settled += 1
@@ -137,6 +143,7 @@ class SettlementTracker:
                 )
 
             self._attempt_counts.pop(slug, None)
+            self._next_retry_at.pop(slug, None)
 
         if settled > 0:
             stats = get_settlement_stats(self._db)
@@ -155,3 +162,9 @@ class SettlementTracker:
     @property
     def stats(self) -> dict[str, Any]:
         return get_settlement_stats(self._db)
+
+    def _schedule_retry(self, slug: str):
+        attempts = self._attempt_counts.get(slug, 0) + 1
+        self._attempt_counts[slug] = attempts
+        backoff = min(MAX_SETTLE_BACKOFF_SECS, self._poll_interval * (2 ** min(attempts - 1, 6)))
+        self._next_retry_at[slug] = time.time() + max(self._poll_interval, backoff)

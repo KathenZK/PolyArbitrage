@@ -38,6 +38,8 @@ TRADE_COLUMNS: dict[str, str] = {
     "last_error": "TEXT DEFAULT ''",
     "raw_json": "TEXT DEFAULT '{}'",
     "settled_side": "TEXT DEFAULT ''",
+    "settled_size": "REAL NOT NULL DEFAULT 0",
+    "settled_cost_usd": "REAL NOT NULL DEFAULT 0",
     "settled_at": "REAL",
     "settlement_source": "TEXT DEFAULT ''",
 }
@@ -531,23 +533,69 @@ def get_fill_calibration_rows(
 
 
 def get_unsettled_trades(conn: sqlite3.Connection) -> list[dict[str, Any]]:
-    """Filled BUY trades where market window has ended but settlement not recorded."""
+    """Expired BUY trades with remaining net shares after later SELLs are netted out FIFO."""
     now = time.time()
     rows = conn.execute(
         """
         SELECT *
         FROM trades
-        WHERE COALESCE(order_side, 'BUY') = 'BUY'
-          AND matched_size > 0
-          AND COALESCE(settled_side, '') = ''
+        WHERE matched_size > 0
           AND market_slug <> ''
           AND expiration_ts > 0
           AND expiration_ts < ?
-        ORDER BY timestamp ASC
+        ORDER BY timestamp ASC, id ASC
         """,
         (now,),
     ).fetchall()
-    return [dict(row) for row in rows]
+    raw_rows = [dict(row) for row in rows]
+    if not raw_rows:
+        return []
+
+    def _pos_key(row: dict[str, Any]) -> tuple[Any, ...]:
+        return (
+            int(row.get("is_paper", 1) or 0),
+            str(row.get("asset", "") or ""),
+            str(row.get("market_id", "") or ""),
+            str(row.get("condition_id", "") or ""),
+            str(row.get("market_slug", "") or ""),
+            str(row.get("token_id", "") or ""),
+            str(row.get("side", "") or ""),
+            str(row.get("action", "") or ""),
+        )
+
+    sell_remaining: dict[tuple[Any, ...], float] = {}
+    for row in raw_rows:
+        if str(row.get("order_side", "BUY") or "BUY").upper() != "SELL":
+            continue
+        key = _pos_key(row)
+        sell_remaining[key] = sell_remaining.get(key, 0.0) + float(row.get("matched_size", 0) or 0)
+
+    unsettled: list[dict[str, Any]] = []
+    for row in raw_rows:
+        if str(row.get("order_side", "BUY") or "BUY").upper() != "BUY":
+            continue
+        if str(row.get("settled_side", "") or ""):
+            continue
+
+        key = _pos_key(row)
+        matched_size = float(row.get("matched_size", 0) or 0)
+        if matched_size <= 1e-9:
+            continue
+
+        consumed = min(matched_size, sell_remaining.get(key, 0.0))
+        if consumed > 0:
+            sell_remaining[key] = max(0.0, sell_remaining.get(key, 0.0) - consumed)
+        remaining_size = matched_size - consumed
+        if remaining_size <= 1e-9:
+            continue
+
+        matched_cost = float(row.get("matched_cost_usd", 0) or 0)
+        remaining_cost = matched_cost * (remaining_size / matched_size)
+        row["remaining_size"] = remaining_size
+        row["remaining_cost_usd"] = remaining_cost
+        unsettled.append(row)
+
+    return unsettled
 
 
 def settle_trade(
@@ -556,16 +604,29 @@ def settle_trade(
     *,
     settled_side: str,
     pnl: float,
+    settled_size: float | None = None,
+    settled_cost_usd: float | None = None,
     settlement_source: str = "",
 ):
     now = time.time()
+    if settled_size is None or settled_cost_usd is None:
+        row = conn.execute(
+            "SELECT matched_size, matched_cost_usd FROM trades WHERE id=?",
+            (trade_id,),
+        ).fetchone()
+        matched_size = float(row["matched_size"] or 0) if row else 0.0
+        matched_cost = float(row["matched_cost_usd"] or 0) if row else 0.0
+        if settled_size is None:
+            settled_size = matched_size
+        if settled_cost_usd is None:
+            settled_cost_usd = matched_cost
     conn.execute(
         """
         UPDATE trades
-        SET settled_side=?, pnl=?, settled_at=?, settlement_source=?, updated_at=?
+        SET settled_side=?, pnl=?, settled_size=?, settled_cost_usd=?, settled_at=?, settlement_source=?, updated_at=?
         WHERE id=?
         """,
-        (settled_side, pnl, now, settlement_source, now, trade_id),
+        (settled_side, pnl, settled_size, settled_cost_usd, now, settlement_source, now, trade_id),
     )
     conn.commit()
 
@@ -579,12 +640,22 @@ def get_settlement_stats(conn: sqlite3.Connection) -> dict[str, Any]:
             SUM(CASE WHEN pnl < 0 THEN 1 ELSE 0 END) AS losses,
             SUM(CASE WHEN pnl = 0 AND settled_side <> '' THEN 1 ELSE 0 END) AS breakeven,
             COALESCE(SUM(pnl), 0) AS total_pnl,
-            COALESCE(SUM(matched_cost_usd), 0) AS total_cost,
+            COALESCE(SUM(
+                CASE
+                    WHEN settled_cost_usd > 0 THEN settled_cost_usd
+                    ELSE matched_cost_usd
+                END
+            ), 0) AS total_cost,
             COALESCE(AVG(win_prob), 0) AS avg_model_win_prob
         FROM trades
         WHERE settled_side <> ''
           AND COALESCE(order_side, 'BUY') = 'BUY'
-          AND matched_size > 0
+          AND (
+                CASE
+                    WHEN settled_size > 0 THEN settled_size
+                    ELSE matched_size
+                END
+              ) > 0
         """
     ).fetchone()
     if not row:

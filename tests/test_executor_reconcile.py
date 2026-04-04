@@ -380,6 +380,81 @@ class ExecutorReconcileTests(unittest.TestCase):
         plan = executor.evaluate_exit_position(position, estimate)
         self.assertIsNone(plan)
 
+    def test_total_directional_exposure_uses_open_positions_not_recent_orders(self):
+        old_ts = time.time() - 7200
+        insert_trade(
+            self.conn,
+            strategy="latency_arb",
+            event_title="btc old",
+            action="UP",
+            side="Up",
+            order_side="BUY",
+            asset="BTC",
+            market_id="old-btc",
+            condition_id="cond-btc",
+            market_slug="btc-old",
+            token_id="token-btc-up",
+            price=0.50,
+            size=20.0,
+            matched_size=20.0,
+            cost_usd=10.0,
+            matched_cost_usd=10.0,
+            is_paper=False,
+            status="filled",
+            order_id="btc-old-order",
+            win_prob=0.8,
+            fill_prob=0.3,
+            fill_lower_bound=0.2,
+            fill_confidence=0.1,
+            fill_effective_samples=1.0,
+            fill_source="seed",
+            filled_ev_usd=0.5,
+            expected_value_usd=0.1,
+            taker_fee_avoided=0.0,
+        )
+        self.conn.execute("UPDATE trades SET timestamp=?, updated_at=? WHERE order_id='btc-old-order'", (old_ts, old_ts))
+        insert_trade(
+            self.conn,
+            strategy="latency_arb",
+            event_title="eth old",
+            action="UP",
+            side="Up",
+            order_side="BUY",
+            asset="ETH",
+            market_id="old-eth",
+            condition_id="cond-eth",
+            market_slug="eth-old",
+            token_id="token-eth-up",
+            price=0.40,
+            size=20.0,
+            matched_size=20.0,
+            cost_usd=8.0,
+            matched_cost_usd=8.0,
+            is_paper=False,
+            status="filled",
+            order_id="eth-old-order",
+            win_prob=0.8,
+            fill_prob=0.3,
+            fill_lower_bound=0.2,
+            fill_confidence=0.1,
+            fill_effective_samples=1.0,
+            fill_source="seed",
+            filled_ev_usd=0.5,
+            expected_value_usd=0.1,
+            taker_fee_avoided=0.0,
+        )
+        self.conn.execute("UPDATE trades SET timestamp=?, updated_at=? WHERE order_id='eth-old-order'", (old_ts, old_ts))
+        self.conn.commit()
+
+        executor = Executor(dry_run=False, bet_size_usd=6.0, max_total_directional_exposure_usd=15.0)
+        executor.attach_db(self.conn)
+        executor._clob = FakeCLOB(final_status="matched")
+
+        plan = executor.evaluate_signal(build_signal())
+
+        self.assertIsNone(plan)
+        self.assertEqual(executor.skipped_live_limits, 1)
+
 
 if __name__ == "__main__":
     unittest.main()
