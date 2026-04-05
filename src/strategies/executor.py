@@ -437,6 +437,48 @@ class Executor:
             return abs(bid - token_price) <= max(self._quote_max_mid_deviation_abs, tick * 6)
         return abs(ask - token_price) <= max(self._quote_max_mid_deviation_abs, tick * 6)
 
+    def _quote_reject_reason(self, *, token_price: float, bid: float, ask: float, tick_size: float) -> str:
+        tick = max(tick_size, 0.001)
+        if token_price <= tick or token_price >= 1.0 - tick:
+            return f"token_price_extreme token_price={token_price:.3f} tick={tick:.3f}"
+        if bid <= 0 and ask <= 0:
+            return "empty_book"
+        if bid > 0 and ask > 0:
+            if ask <= bid:
+                return f"crossed_or_inverted bid={bid:.3f} ask={ask:.3f}"
+            spread = ask - bid
+            mid = 0.5 * (bid + ask)
+            if spread > max(self._quote_max_spread_abs, tick * 6):
+                return (
+                    f"spread_too_wide spread={spread:.3f} "
+                    f"limit={max(self._quote_max_spread_abs, tick * 6):.3f}"
+                )
+            if abs(mid - token_price) > max(self._quote_max_mid_deviation_abs, tick * 4):
+                return (
+                    f"mid_too_far mid={mid:.3f} token_price={token_price:.3f} "
+                    f"limit={max(self._quote_max_mid_deviation_abs, tick * 4):.3f}"
+                )
+            if (
+                token_price > 0.10
+                and token_price < 0.90
+                and bid <= self._quote_extreme_edge_threshold
+                and ask >= 1.0 - self._quote_extreme_edge_threshold
+            ):
+                return (
+                    f"extreme_dust_book bid={bid:.3f} ask={ask:.3f} "
+                    f"threshold={self._quote_extreme_edge_threshold:.3f}"
+                )
+            return "unknown_bid_ask_reject"
+        if bid > 0:
+            return (
+                f"bid_only_too_far bid={bid:.3f} token_price={token_price:.3f} "
+                f"limit={max(self._quote_max_mid_deviation_abs, tick * 6):.3f}"
+            )
+        return (
+            f"ask_only_too_far ask={ask:.3f} token_price={token_price:.3f} "
+            f"limit={max(self._quote_max_mid_deviation_abs, tick * 6):.3f}"
+        )
+
     def _sanitize_quote(
         self,
         token_id: str,
@@ -463,6 +505,24 @@ class Executor:
                 bid_depth_usd=max(0.0, quote.bid_depth_usd),
                 ask_depth_usd=max(0.0, quote.ask_depth_usd),
             )
+        logger.info(
+            "Reject raw token book %s: %s | token_price=%.3f bid=%.3f ask=%.3f "
+            "bid_size=%.2f ask_size=%.2f bid_notional=%.2f ask_notional=%.2f "
+            "bid_depth=%.2f ask_depth=%.2f tick=%.3f source=%s",
+            token_id,
+            self._quote_reject_reason(token_price=token_price, bid=bid, ask=ask, tick_size=tick),
+            token_price,
+            bid,
+            ask,
+            max(0.0, quote.best_bid_size),
+            max(0.0, quote.best_ask_size),
+            max(0.0, quote.best_bid_notional),
+            max(0.0, quote.best_ask_notional),
+            max(0.0, quote.bid_depth_usd),
+            max(0.0, quote.ask_depth_usd),
+            tick,
+            quote.source or "book",
+        )
         if not self._allow_quote_fallback:
             return None
         fallback = self._fallback_token_quote(token_id, token_price, tick_size=tick)

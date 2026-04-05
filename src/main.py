@@ -204,6 +204,7 @@ class Pipeline:
         try:
             result = await self.executor.execute(signal)
             if result:
+                self.guard.on_trade_submitted(signal)
                 logger.info(
                     f"Trade #{result.order_id}: {result.direction} {signal.asset} "
                     f"{result.order_side.lower()} {result.token_side} ${result.cost_usd:.2f}"
@@ -220,7 +221,10 @@ class Pipeline:
                     is_paper=result.is_paper,
                     order_id=result.order_id,
                 )
+            else:
+                self.guard.on_trade_rejected(signal)
         except Exception as e:
+            self.guard.on_trade_rejected(signal)
             logger.error(f"Execution error: {e}")
 
     def _market_for_position(self, position):

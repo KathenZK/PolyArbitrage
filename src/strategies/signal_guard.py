@@ -22,6 +22,7 @@ class SignalGuard:
     def __init__(self, cooldown_secs: float = 120):
         self._cooldown = cooldown_secs
         self._traded_slugs: set[str] = set()
+        self._inflight_slugs: set[str] = set()
         self._last: dict[str, tuple[Direction, float]] = {}
         self.suppressed_count = 0
         self.blocked_reversal_count = 0
@@ -45,12 +46,14 @@ class SignalGuard:
     def should_trade(self, signal: Signal) -> bool:
         slug = signal.market.slug
         now = signal.timestamp or time.time()
-
         if slug in self._traded_slugs:
             self.suppressed_count += 1
             self._record_block("window_already_traded", f"{signal.asset} {signal.direction.value} slug={slug}")
             return False
-
+        if slug in self._inflight_slugs:
+            self.suppressed_count += 1
+            self._record_block("window_inflight", f"{signal.asset} {signal.direction.value} slug={slug}")
+            return False
         key = signal.binance_symbol
         if key in self._last:
             last_dir, last_ts = self._last[key]
@@ -62,11 +65,23 @@ class SignalGuard:
                 )
                 return False
 
-        self._last[key] = (signal.direction, now)
-        self._traded_slugs.add(slug)
+        self._inflight_slugs.add(slug)
         return True
+
+    def on_trade_rejected(self, signal: Signal):
+        self._inflight_slugs.discard(signal.market.slug)
+
+    def on_trade_submitted(self, signal: Signal):
+        slug = signal.market.slug
+        now = signal.timestamp or time.time()
+        self._inflight_slugs.discard(slug)
+        self._traded_slugs.add(slug)
+
+        key = signal.binance_symbol
+        self._last[key] = (signal.direction, now)
 
     def on_window_change(self):
         """Call when a new 15-min window starts to reset all tracking."""
         self._traded_slugs.clear()
+        self._inflight_slugs.clear()
         self._last.clear()
