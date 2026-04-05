@@ -1,0 +1,45 @@
+{
+  "rows": 49098,
+  "signals": 651,
+  "trades": 2,
+  "expected_submitted_ev": 0.3210500631901043,
+  "expected_filled_ev": 2.53813870816591,
+  "realized_filled_pnl": 4.6,
+  "realized_submitted_pnl": 0.0,
+  "avg_fill_prob": 0.23274999999999998,
+  "by_asset": {
+    "ETH": {
+      "trades": 2.0,
+      "submitted_ev": 0.3210500631901043,
+      "realized_submitted_pnl": 0.0
+    }
+  },
+  "trade_log": [
+    {
+      "timestamp": 1775299281.07,
+      "asset": "ETH",
+      "direction": "UP",
+      "quote_price": 0.43,
+      "win_prob": 0.7787597790960394,
+      "fill_prob": 0.23274999999999998,
+      "actual_fill_ratio": null,
+      "filled_ev": 1.7437988954801973,
+      "submitted_ev": 0.22057373924583637,
+      "realized_filled_pnl": 2.85,
+      "realized_submitted_pnl": null
+    },
+    {
+      "timestamp": 1775315560.101,
+      "asset": "ETH",
+      "direction": "UP",
+      "quote_price": 0.65,
+      "win_prob": 0.8088679625371425,
+      "fill_prob": 0.23274999999999998,
+      "actual_fill_ratio": null,
+      "filled_ev": 0.7943398126857129,
+      "submitted_ev": 0.10047632394426793,
+      "realized_filled_pnl": 1.7499999999999996,
+      "realized_submitted_pnl": null
+    }
+  ]
+}

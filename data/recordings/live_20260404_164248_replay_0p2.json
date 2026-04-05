@@ -1,0 +1,120 @@
+{
+  "rows": 49098,
+  "signals": 1577,
+  "trades": 7,
+  "expected_submitted_ev": 1.0806054291951332,
+  "expected_filled_ev": 8.54298685021702,
+  "realized_filled_pnl": 19.861815661815662,
+  "realized_submitted_pnl": 0.0,
+  "avg_fill_prob": 0.23274999999999998,
+  "by_asset": {
+    "ETH": {
+      "trades": 3.0,
+      "submitted_ev": 0.5016794173003934,
+      "realized_submitted_pnl": 0.0
+    },
+    "BTC": {
+      "trades": 3.0,
+      "submitted_ev": 0.4661881641269906,
+      "realized_submitted_pnl": 0.0
+    },
+    "SOL": {
+      "trades": 1.0,
+      "submitted_ev": 0.11273784776774902,
+      "realized_submitted_pnl": 0.0
+    }
+  },
+  "trade_log": [
+    {
+      "timestamp": 1775299256.047,
+      "asset": "ETH",
+      "direction": "UP",
+      "quote_price": 0.43,
+      "win_prob": 0.6841119633362162,
+      "fill_prob": 0.23274999999999998,
+      "actual_fill_ratio": null,
+      "filled_ev": 1.2705598166810808,
+      "submitted_ev": 0.16071356073641516,
+      "realized_filled_pnl": 2.85,
+      "realized_submitted_pnl": null
+    },
+    {
+      "timestamp": 1775299756.169,
+      "asset": "BTC",
+      "direction": "UP",
+      "quote_price": 0.44,
+      "win_prob": 0.649971406311733,
+      "fill_prob": 0.23274999999999998,
+      "actual_fill_ratio": null,
+      "filled_ev": 1.0498570315586653,
+      "submitted_ev": 0.13279678736157255,
+      "realized_filled_pnl": 2.8000000000000007,
+      "realized_submitted_pnl": null
+    },
+    {
+      "timestamp": 1775309856.654,
+      "asset": "BTC",
+      "direction": "UP",
+      "quote_price": 0.37,
+      "win_prob": 0.6708291090007901,
+      "fill_prob": 0.23274999999999998,
+      "actual_fill_ratio": null,
+      "filled_ev": 1.6261032918961624,
+      "submitted_ev": 0.20568638070775372,
+      "realized_filled_pnl": 3.4054054054054053,
+      "realized_submitted_pnl": null
+    },
+    {
+      "timestamp": 1775309879.814,
+      "asset": "ETH",
+      "direction": "UP",
+      "quote_price": 0.39,
+      "win_prob": 0.6202201649411416,
+      "fill_prob": 0.23274999999999993,
+      "actual_fill_ratio": null,
+      "filled_ev": 1.1806162304673928,
+      "submitted_ev": 0.14933656469417927,
+      "realized_filled_pnl": 3.1282051282051277,
+      "realized_submitted_pnl": null
+    },
+    {
+      "timestamp": 1775313567.882,
+      "asset": "BTC",
+      "direction": "DOWN",
+      "quote_price": 0.48,
+      "win_prob": 0.6819205294647166,
+      "fill_prob": 0.23274999999999998,
+      "actual_fill_ratio": null,
+      "filled_ev": 1.0096026473235828,
+      "submitted_ev": 0.12770499605766436,
+      "realized_filled_pnl": 2.6,
+      "realized_submitted_pnl": null
+    },
+    {
+      "timestamp": 1775318331.396,
+      "asset": "SOL",
+      "direction": "UP",
+      "quote_price": 0.61,
+      "win_prob": 0.7882552493224111,
+      "fill_prob": 0.23274999999999998,
+      "actual_fill_ratio": null,
+      "filled_ev": 0.8912762466120558,
+      "submitted_ev": 0.11273784776774902,
+      "realized_filled_pnl": 1.95,
+      "realized_submitted_pnl": null
+    },
+    {
+      "timestamp": 1775319901.72,
+      "asset": "ETH",
+      "direction": "UP",
+      "quote_price": 0.39,
+      "win_prob": 0.6854194592072257,
+      "fill_prob": 0.23274999999999993,
+      "actual_fill_ratio": null,
+      "filled_ev": 1.5149715856780803,
+      "submitted_ev": 0.19162929186979907,
+      "realized_filled_pnl": 3.1282051282051277,
+      "realized_submitted_pnl": null
+    }
+  ]
+}

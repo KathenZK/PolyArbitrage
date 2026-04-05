@@ -1,0 +1,85 @@
+strategy:
+  symbols: ["btcusdt", "ethusdt", "solusdt"]
+
+  edge_threshold_pct: 0.002
+  min_secs_remaining: 30
+  min_secs_elapsed: 30
+  require_official_source: true
+  official_max_age_sec: 15
+  max_source_divergence_pct: 0.0025
+  source_gap_penalty_mult: 8.0
+
+  annual_vol_btcusdt: 0.60
+  annual_vol_ethusdt: 0.75
+  annual_vol_solusdt: 1.00
+
+  use_realized_vol: true
+  realized_vol_lookback_sec: 300
+  realized_vol_min_ticks: 20
+
+  signal_cooldown_sec: 120
+
+  fat_tail_dampening: 0.80
+  max_win_prob: 0.92
+
+  bet_size_usd: 2
+  max_bet_multiplier: 2.5
+  min_liquidity: 1000
+  min_ev_usd: 0.10
+  adverse_selection_haircut: 0.08
+  adverse_selection_time_ramp_sec: 300
+  fill_adverse_coeff: 0.05
+  maker_offset_ticks: 1
+  fill_rate_prior: 0.35
+  fill_min_samples: 20
+  fill_lookback_hours: 168
+  fill_decay_half_life_hours: 24
+  fill_prior_strength: 12
+  fill_confidence_scale: 8
+  fill_lower_bound_z: 1.0
+  quote_max_spread_abs: 0.12
+  quote_max_mid_deviation_abs: 0.10
+  quote_extreme_edge_threshold: 0.02
+  allow_quote_fallback: true
+  live_require_executable_quote: true
+  entry_min_top_book_ratio: 1.0
+  exit_min_top_bid_ratio: 1.0
+
+  exit_enabled: true
+  exit_poll_interval_sec: 5
+  exit_min_hold_secs: 15
+  exit_resolution_buffer: 0.015
+  exit_capital_lock_penalty: 0.01
+  exit_min_improvement_abs: 0.005
+
+  prob_calibration_path: "data/calibration/prob_calibration.json"
+  prob_calibration_min_samples: 50
+  prob_calibration_prior_strength: 20.0
+
+  registry_refresh_sec: 15
+  official_refresh_sec: 5
+
+risk:
+  dry_run: true
+  require_live_arm: true
+  clob_heartbeat_interval_sec: 5
+  max_live_orders_per_day: 4
+  max_live_notional_usd_per_day: 20
+  max_consecutive_expired: 8
+  circuit_breaker_cooldown_sec: 900
+  max_directional_exposure_usd: 15
+  max_total_directional_exposure_usd: 25
+
+settlement:
+  poll_interval_sec: 60
+
+redeem:
+  enabled: true
+  require_auth: true
+  tracked_strategy_only: true
+  poll_interval_sec: 180
+
+alerts:
+  dingtalk_webhook: ""
+  dingtalk_keyword: "PolyGod"
+  heartbeat_interval_sec: 0

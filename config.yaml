@@ -2,7 +2,7 @@ strategy:
   symbols: ["btcusdt", "ethusdt", "solusdt"]
 
   # Signal: trade the official Polymarket event, not raw Binance spot
-  edge_threshold_pct: 0.003        # 0.3% minimum deviation — live pilot favors more samples
+  edge_threshold_pct: 0.002        # 0.2% minimum deviation — live pilot prioritizes real fill samples
   min_secs_remaining: 30           # skip markets with < 30s left
   min_secs_elapsed: 30             # wait 30s after window opens before trading
   require_official_source: true    # require official Polymarket/Chainlink anchor before trading

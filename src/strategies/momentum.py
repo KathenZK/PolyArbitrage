@@ -26,12 +26,16 @@ where q is the Polymarket entry price.
 from __future__ import annotations
 
 import json
+import logging
+import time
 from enum import Enum
 from math import erf, sqrt
 from pathlib import Path
 from dataclasses import dataclass
 
 from src.data.market_registry import CryptoMarket, MarketRegistry
+
+logger = logging.getLogger(__name__)
 
 SECS_PER_YEAR = 365.25 * 24 * 3600
 
@@ -313,6 +317,11 @@ class PriceComparator:
         self._use_realized_vol = use_realized_vol
         self._fat_tail_dampening = fat_tail_dampening
         self._max_win_prob = max_win_prob
+        self._skip_counts: dict[str, int] = {}
+        self._skip_last_log_ts: dict[str, float] = {}
+        self._skip_log_interval_sec = 30.0
+        self.last_skip_reason = ""
+        self.last_skip_detail = ""
         self._calibrator = ProbabilityCalibrator(
             prob_calibration_path,
             min_samples=prob_calibration_min_samples,
@@ -365,19 +374,40 @@ class PriceComparator:
             return 0.0
         return market.official_opening_price * (binance_price / market.opening_price)
 
+    def _record_skip(self, reason: str, detail: str):
+        self.last_skip_reason = reason
+        self.last_skip_detail = detail
+        count = self._skip_counts.get(reason, 0) + 1
+        self._skip_counts[reason] = count
+        now = time.time()
+        last_ts = self._skip_last_log_ts.get(reason, 0.0)
+        if count <= 3 or now - last_ts >= self._skip_log_interval_sec:
+            logger.info(f"No signal [{reason}] x{count}: {detail}")
+            self._skip_last_log_ts[reason] = now
+
     def estimate(self, binance_symbol: str, price: float, timestamp: float) -> MarketEstimate | None:
         if self._registry.in_transition:
+            self._record_skip("registry_transition", f"{binance_symbol}: market registry in transition")
             return None
 
         market = self._registry.get_market(binance_symbol)
         if not market:
+            self._record_skip("market_missing", f"{binance_symbol}: no active market")
             return None
 
         remaining = market.secs_remaining
         if remaining < self._min_remaining:
+            self._record_skip(
+                "too_close_to_expiry",
+                f"{market.asset}: secs_remaining={remaining:.1f} < {self._min_remaining:.1f}",
+            )
             return None
 
         if market.secs_elapsed < self._min_elapsed:
+            self._record_skip(
+                "too_early_in_window",
+                f"{market.asset}: secs_elapsed={market.secs_elapsed:.1f} < {self._min_elapsed:.1f}",
+            )
             return None
 
         binance_deviation = 0.0
@@ -406,6 +436,12 @@ class PriceComparator:
                 using_anchor_only = True
 
         if not using_official and self._require_official_source:
+            self._record_skip(
+                "official_source_required",
+                f"{market.asset}: missing usable official source "
+                f"(open={market.has_official_opening_price}, current={market.has_official_calibration}, "
+                f"age={cal_age:.1f}s)",
+            )
             return None
 
         effective_deviation = official_deviation if using_official else binance_deviation
@@ -415,8 +451,17 @@ class PriceComparator:
                 and abs(official_deviation) >= self._threshold
                 and binance_deviation * official_deviation < 0
             ):
+                self._record_skip(
+                    "source_direction_conflict",
+                    f"{market.asset}: binance={binance_deviation:+.3%} official={official_deviation:+.3%}",
+                )
                 return None
             if abs(binance_deviation - official_deviation) > self._max_source_divergence:
+                self._record_skip(
+                    "source_gap_too_wide",
+                    f"{market.asset}: gap={abs(binance_deviation - official_deviation):.3%} > "
+                    f"{self._max_source_divergence:.3%}",
+                )
                 return None
 
         annual_vol = self._vols.get(binance_symbol, 0.70)
@@ -482,6 +527,11 @@ class PriceComparator:
         if estimate is None:
             return None
         if abs(estimate.effective_deviation_pct) < self._threshold:
+            self._record_skip(
+                "below_threshold",
+                f"{estimate.asset}: deviation={estimate.effective_deviation_pct:+.3%} < {self._threshold:.3%} "
+                f"source={estimate.price_source}",
+            )
             return None
         direction = Direction.UP if estimate.effective_deviation_pct > 0 else Direction.DOWN
         win_prob = estimate.up_win_prob if direction == Direction.UP else estimate.down_win_prob

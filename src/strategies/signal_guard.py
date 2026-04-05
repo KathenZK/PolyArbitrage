@@ -8,9 +8,12 @@ Rules:
 
 from __future__ import annotations
 
+import logging
 import time
 
 from src.strategies.momentum import Direction, Signal
+
+logger = logging.getLogger(__name__)
 
 
 class SignalGuard:
@@ -22,6 +25,22 @@ class SignalGuard:
         self._last: dict[str, tuple[Direction, float]] = {}
         self.suppressed_count = 0
         self.blocked_reversal_count = 0
+        self._block_counts: dict[str, int] = {}
+        self._last_log_ts: dict[str, float] = {}
+        self._log_interval_sec = 30.0
+        self.last_block_reason = ""
+        self.last_block_detail = ""
+
+    def _record_block(self, reason: str, detail: str):
+        self.last_block_reason = reason
+        self.last_block_detail = detail
+        count = self._block_counts.get(reason, 0) + 1
+        self._block_counts[reason] = count
+        now = time.time()
+        last_ts = self._last_log_ts.get(reason, 0.0)
+        if count <= 3 or now - last_ts >= self._log_interval_sec:
+            logger.info(f"Guard blocked [{reason}] x{count}: {detail}")
+            self._last_log_ts[reason] = now
 
     def should_trade(self, signal: Signal) -> bool:
         slug = signal.market.slug
@@ -29,6 +48,7 @@ class SignalGuard:
 
         if slug in self._traded_slugs:
             self.suppressed_count += 1
+            self._record_block("window_already_traded", f"{signal.asset} {signal.direction.value} slug={slug}")
             return False
 
         key = signal.binance_symbol
@@ -36,6 +56,10 @@ class SignalGuard:
             last_dir, last_ts = self._last[key]
             if signal.direction == last_dir and (now - last_ts) < self._cooldown:
                 self.suppressed_count += 1
+                self._record_block(
+                    "cooldown_same_direction",
+                    f"{signal.asset} {signal.direction.value} dt={now - last_ts:.1f}s < {self._cooldown:.1f}s",
+                )
                 return False
 
         self._last[key] = (signal.direction, now)

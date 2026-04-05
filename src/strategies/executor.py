@@ -300,6 +300,26 @@ class Executor:
         self._heartbeat_id = ""
         self._fill_stats_cache: dict[tuple[str, str, str, str, str], tuple[float, FillEstimate]] = {}
         self._execute_lock = asyncio.Lock()
+        self._skip_counts: dict[str, int] = {}
+        self._skip_last_log_ts: dict[str, float] = {}
+        self._skip_log_interval_sec = 30.0
+        self.last_skip_reason = ""
+        self.last_skip_detail = ""
+
+    def _record_skip_reason(self, reason: str, detail: str, *, level: str = "info"):
+        self.last_skip_reason = reason
+        self.last_skip_detail = detail
+        count = self._skip_counts.get(reason, 0) + 1
+        self._skip_counts[reason] = count
+        now = time.time()
+        last_ts = self._skip_last_log_ts.get(reason, 0.0)
+        if count <= 3 or now - last_ts >= self._skip_log_interval_sec:
+            message = f"Execution skip [{reason}] x{count}: {detail}"
+            if level == "warning":
+                logger.warning(message)
+            else:
+                logger.info(message)
+            self._skip_last_log_ts[reason] = now
 
     @property
     def trade_count(self) -> int:
@@ -1344,12 +1364,21 @@ class Executor:
         if market.liquidity < self._min_liquidity:
             if count_skips:
                 self._skipped_low_liq += 1
+            self._record_skip_reason(
+                "low_liquidity",
+                f"{signal.asset} {signal.direction.value}: market_liquidity=${market.liquidity:,.0f} < ${self._min_liquidity:,.0f}",
+            )
             return None
 
         if self._circuit_breaker_until > 0:
             if time.time() < self._circuit_breaker_until:
                 if count_skips:
                     self._skipped_circuit_breaker += 1
+                self._record_skip_reason(
+                    "circuit_breaker",
+                    f"{signal.asset}: paused until {self._circuit_breaker_until:.0f}",
+                    level="warning",
+                )
                 return None
             self._circuit_breaker_until = 0.0
             self._consecutive_expired = 0
@@ -1364,6 +1393,10 @@ class Executor:
             token_side = "Down"
 
         if token_price <= 0.01 or token_price >= 0.99:
+            self._record_skip_reason(
+                "token_price_extreme",
+                f"{signal.asset} {signal.direction.value}: token_price={token_price:.3f} outside sane range",
+            )
             return None
 
         quote = self._resolve_token_quote(token_id, token_price, market, direction=signal.direction.value)
@@ -1389,20 +1422,25 @@ class Executor:
             if effective_bet > self._bet_size * self._max_bet_multiplier:
                 if count_skips:
                     self._skipped_bet_size += 1
+                self._record_skip_reason(
+                    "min_order_size_too_large",
+                    f"{signal.asset} {signal.direction.value}: effective_bet=${effective_bet:.2f} > "
+                    f"max ${self._bet_size * self._max_bet_multiplier:.2f}",
+                )
                 return None
         else:
             effective_bet = self._bet_size
 
         if not self._dry_run and self._live_require_executable_quote and not quote.executable_book:
-            logger.debug(
-                f"Skip {signal.asset} {signal.direction.value}: "
-                f"live quote fallback disabled ({quote.source})"
+            self._record_skip_reason(
+                "non_executable_quote",
+                f"{signal.asset} {signal.direction.value}: live quote fallback disabled ({quote.source})"
             )
             return None
         if not self._dry_run and not self._entry_quote_depth_ok(quote, effective_bet):
-            logger.debug(
-                f"Skip {signal.asset} {signal.direction.value}: "
-                f"top book too shallow for ${effective_bet:.2f} "
+            self._record_skip_reason(
+                "top_book_too_shallow",
+                f"{signal.asset} {signal.direction.value}: top book too shallow for ${effective_bet:.2f} "
                 f"(bid_notional=${quote.best_bid_notional:.2f}, ask_notional=${quote.best_ask_notional:.2f})"
             )
             return None
@@ -1413,9 +1451,9 @@ class Executor:
         if p <= q:
             if count_skips:
                 self._skipped_no_edge += 1
-            logger.debug(
-                f"Skip {signal.asset} {signal.direction.value}: "
-                f"p={p:.3f} <= q={q:.3f} after {haircut:.1%} haircut"
+            self._record_skip_reason(
+                "no_edge_after_haircut",
+                f"{signal.asset} {signal.direction.value}: p={p:.3f} <= q={q:.3f} after {haircut:.1%} haircut"
             )
             return None
 
@@ -1424,9 +1462,10 @@ class Executor:
             if self._max_live_orders_per_day > 0 and live_orders_today >= self._max_live_orders_per_day:
                 if count_skips:
                     self._skipped_live_limits += 1
-                logger.warning(
-                    f"Skip live trade: daily order limit reached "
-                    f"({live_orders_today}/{self._max_live_orders_per_day})"
+                self._record_skip_reason(
+                    "daily_order_limit",
+                    f"daily order limit reached ({live_orders_today}/{self._max_live_orders_per_day})",
+                    level="warning",
                 )
                 return None
             if (
@@ -1435,10 +1474,11 @@ class Executor:
             ):
                 if count_skips:
                     self._skipped_live_limits += 1
-                logger.warning(
-                    f"Skip live trade: daily notional cap reached "
-                    f"(${live_notional_today:.2f} + ${effective_bet:.2f} > "
-                    f"${self._max_live_notional_usd_per_day:.2f})"
+                self._record_skip_reason(
+                    "daily_notional_limit",
+                    f"daily notional cap reached (${live_notional_today:.2f} + ${effective_bet:.2f} > "
+                    f"${self._max_live_notional_usd_per_day:.2f})",
+                    level="warning",
                 )
                 return None
 
@@ -1448,9 +1488,9 @@ class Executor:
             if current_asset_dir + effective_bet > self._max_directional_exposure:
                 if count_skips:
                     self._skipped_live_limits += 1
-                logger.debug(
-                    f"Skip {signal.asset} {signal.direction.value}: "
-                    f"directional exposure ${current_asset_dir:.2f} "
+                self._record_skip_reason(
+                    "asset_directional_exposure_limit",
+                    f"{signal.asset} {signal.direction.value}: directional exposure ${current_asset_dir:.2f} "
                     f"+ ${effective_bet:.2f} > cap ${self._max_directional_exposure:.2f}"
                 )
                 return None
@@ -1461,9 +1501,9 @@ class Executor:
             if total_same_dir + effective_bet > self._max_total_directional_exposure:
                 if count_skips:
                     self._skipped_live_limits += 1
-                logger.debug(
-                    f"Skip {signal.asset} {signal.direction.value}: "
-                    f"total cross-asset exposure ${total_same_dir:.2f} "
+                self._record_skip_reason(
+                    "total_directional_exposure_limit",
+                    f"{signal.asset} {signal.direction.value}: total cross-asset exposure ${total_same_dir:.2f} "
                     f"+ ${effective_bet:.2f} > cap ${self._max_total_directional_exposure:.2f}"
                 )
                 return None
@@ -1481,9 +1521,10 @@ class Executor:
         if p_conditional <= q:
             if count_skips:
                 self._skipped_no_edge += 1
-            logger.debug(
-                f"Skip {signal.asset} {signal.direction.value}: "
-                f"p_cond={p_conditional:.3f} <= q={q:.3f} after fill-adverse discount"
+            self._record_skip_reason(
+                "no_edge_after_fill_discount",
+                f"{signal.asset} {signal.direction.value}: p_cond={p_conditional:.3f} <= q={q:.3f} "
+                f"after fill-adverse discount"
             )
             return None
 
@@ -1494,12 +1535,11 @@ class Executor:
         if submitted_ev < self._min_ev:
             if count_skips:
                 self._skipped_low_ev += 1
-            logger.debug(
-                f"Skip {signal.asset} {signal.direction.value}: "
-                f"submitted_EV ${submitted_ev:.2f} < ${self._min_ev:.2f} "
-                f"(filled_EV=${filled_ev:.2f}, "
-                f"fill~{fill_estimate.expected_fill_ratio:.1%}/lb {fill_estimate.conservative_fill_ratio:.1%}, "
-                f"p_cond={p_conditional:.3f}, q={q:.2f})"
+            self._record_skip_reason(
+                "submitted_ev_too_low",
+                f"{signal.asset} {signal.direction.value}: submitted_EV ${submitted_ev:.2f} < ${self._min_ev:.2f} "
+                f"(filled_EV=${filled_ev:.2f}, fill~{fill_estimate.expected_fill_ratio:.1%}/lb "
+                f"{fill_estimate.conservative_fill_ratio:.1%}, p_cond={p_conditional:.3f}, q={q:.2f})"
             )
             return None
 
